@@ -1,0 +1,472 @@
+From 0000000000000000000000000000000000000021 Mon Sep 17 00:00:00 2001
+From: Yuzhi Zhu <explodingtnt@foxmail.com>
+Date: Sun, 2 Nov 2026 13:10:00 +0800
+Subject: [PATCH 21/21] hp39gii: SmartFS partition layout, NCB backup repair,
+ boot counter
+
+The board bring-up ends here: the NAND is partitioned so that everything
+below block 238 (the stock firmware area) is never touched, blocks
+245..1023 carry a 97 MB SmartFS volume, and block 4 -- the second copy of
+the stock NCB -- is repaired from block 0 if an earlier, wrong
+mtd_partition() call erased it.
+
+mtd_partition() takes its arguments in read/write blocks (pages here), not
+erase blocks; passing erase blocks put the partition on top of block 4.
+The repair path is the fix for the units.
+
+Also adds a boot counter in /mnt/boot.txt so that a written-then-read-back
+value proves the file really reached NAND instead of staying in cache.
+---
+ boards/arm/stmp3770/hp39gii/configs/nsh/defconfig  |   2 +
+ boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c     | 326 +++++++++++++++-------
+ arch/arm/src/stmp3770/stmp3770_mtd.c               |  23 ++-
+ 3 files changed, 262 insertions(+), 89 deletions(-)
+
+diff --git a/arch/arm/src/stmp3770/stmp3770_mtd.c b/arch/arm/src/stmp3770/stmp3770_mtd.c
+index 67d080dc..4ad3203c 100644
+--- a/arch/arm/src/stmp3770/stmp3770_mtd.c
++++ b/arch/arm/src/stmp3770/stmp3770_mtd.c
+@@ -63,12 +63,25 @@ static ssize_t stmp3770_mtd_bwrite(FAR struct mtd_dev_s *dev,
+ {
+   FAR struct stmp3770_mtd_dev_s *priv =
+       (FAR struct stmp3770_mtd_dev_s *)dev;
++
++  /* GPMI 的写 DMA 直接拿调用者的缓冲区当地址，源地址必须 32 字节对齐
++   * （在 restore 固件里踩过：不对齐时写进去的内容是坏的）。上层
++   * （SmartFS / MTD SMART）传下来的指针不保证对齐，所以每页先拷进
++   * 对齐的静态缓冲区再编程。
++   */
++
++  static uint8_t wbuf[2048] __attribute__((aligned(32)));
+   size_t i;
+ 
++  if (priv->info.PageSize_B > sizeof(wbuf))
++    {
++      return -EINVAL;
++    }
++
+   for (i = 0; i < nblocks; i++)
+     {
+-      portMTDWritePage((uint32_t)(startblock + i),
+-                       (uint8_t *)(buffer + i * priv->info.PageSize_B));
++      memcpy(wbuf, buffer + i * priv->info.PageSize_B, priv->info.PageSize_B);
++      portMTDWritePage((uint32_t)(startblock + i), wbuf);
+     }
+ 
+   return (ssize_t)nblocks;
+@@ -80,7 +93,7 @@ static ssize_t stmp3770_mtd_read(FAR struct mtd_dev_s *dev,
+ {
+   FAR struct stmp3770_mtd_dev_s *priv =
+       (FAR struct stmp3770_mtd_dev_s *)dev;
+-  static uint32_t pagebuf[2048 / 4];
++  static uint8_t pagebuf[2048] __attribute__((aligned(32)));
+   uint32_t pagesize = priv->info.PageSize_B;
+   size_t done = 0;
+ 
+@@ -95,8 +108,8 @@ static ssize_t stmp3770_mtd_read(FAR struct mtd_dev_s *dev,
+           chunk = nbytes - done;
+         }
+ 
+-      portMTDReadPage(page, (uint8_t *)pagebuf);
+-      memcpy(buffer + done, (uint8_t *)pagebuf + off, chunk);
++      portMTDReadPage(page, pagebuf);
++      memcpy(buffer + done, pagebuf + off, chunk);
+       done += chunk;
+     }
+ 
+diff --git a/boards/arm/stmp3770/hp39gii/configs/nsh/defconfig b/boards/arm/stmp3770/hp39gii/configs/nsh/defconfig
+index 68830540..73d87588 100644
+--- a/boards/arm/stmp3770/hp39gii/configs/nsh/defconfig
++++ b/boards/arm/stmp3770/hp39gii/configs/nsh/defconfig
+@@ -72,3 +72,5 @@ CONFIG_UART0_SERIAL_CONSOLE=y
+ CONFIG_UART0_BASE=0x80070000
+ CONFIG_UART0_IRQ=0
+ CONFIG_UART0_CLK_FREQ=24000000
++CONFIG_MTD_PARTITION=y
++CONFIG_FSUTILS_MKSMARTFS=y
+diff --git a/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c b/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c
+index 3ddef285..df2e1530 100644
+--- a/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c
++++ b/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c
+@@ -159,71 +159,46 @@ static int hp39gii_lcd_thread(int argc, char **argv)
+ #include <nuttx/mtd/mtd.h>
+ #include <nuttx/fs/ioctl.h>
+ #include <nuttx/fs/smart.h>
++#include <stdlib.h>
+ #include <sys/mount.h>
++#include <sys/stat.h>
++#include <string.h>
+ #include <sys/ioctl.h>
+ #include <fcntl.h>
+ #include <errno.h>
+ 
+ FAR struct mtd_dev_s *stmp3770_nand_initialize(void);
+ 
+-/* NAND 冒烟测试：初始化 GPMI+ECC8，读 page 0 和 page 1984（System 区），
+- * 打印前 32 字节。放在低优先级线程里，避免 GPMI 的轮询等待饿死 NSH。
++/* 分区布局（1024 块 × 128 KB = 128 MB）：
++ *
++ *   0 .. 237     原厂系统区（STMP 引导记录 + HP 固件/文件系统）—— 只读
++ *   238 .. 239   隔离带，不碰
++ *   240          擦写自检块：每次启动擦→写→读回→再擦，不参与文件系统
++ *   241 .. 368   SmartFS 卷（128 块 = 16 MB）
++ *   369 .. 1023  空闲，留给以后扩卷
++ *
++ * 238 块往后的数据和 OOB 在原厂镜像里全是 ff（既没有坏块标记，也没有厂家
++ * 的块表），所以这一片可以拿来用；0..237 由原厂系统独占。
+  */
+ 
+-/* 把一段字节以十六进制打到 LCD 控制台。 */
+-
+-static void nand_hex_line(FAR const char *tag, FAR const uint8_t *p, int n)
+-{
+-  static const char hex[] = "0123456789abcdef";
+-  char line[64];
+-  int i;
+-  int k = 0;
+-
+-  while (*tag != 0 && k < 20)
+-    {
+-      line[k++] = *tag++;
+-    }
+-
+-  for (i = 0; i < n && k < 60; i++)
+-    {
+-      line[k++] = hex[p[i] >> 4];
+-      line[k++] = hex[p[i] & 15];
+-      line[k++] = 0x20;
+-    }
+-
+-  line[k++] = 0x0d;
+-  line[k++] = 0x0a;
+-  line[k]   = 0;
++/* 双启动菜单版布局：
++ *   240        菜单固件（BootROM 经 LDLB 载入到 0x30000）
++ *   241..242   原厂引导段（离线解密的 SB 指令流，安装工具写入）
++ *   243..244   NuttX 镜像（安装工具写入）
++ *   245..1023  SmartFS 卷（779 块 ≈ 97.4 MB）
++ */
++#define HP39GII_NAND_FS_FIRST   245
++#define HP39GII_NAND_FS_BLOCKS  779
+ 
+-  stmp3770_lcdcon_puts(line);
+-}
++#define HP39GII_NAND_PAGE_SIZE  2048
++#define HP39GII_NAND_PAGES_PBLK 64
+ 
+-/* 打一个 32 位十六进制值（带标签）到 LCD 控制台。 */
++/* 打一行文本到 LCD 控制台。 */
+ 
+-static void nand_hex32(FAR const char *tag, uint32_t v)
++static void nand_put(FAR const char *s)
+ {
+-  static const char hex[] = "0123456789abcdef";
+-  char b[40];
+-  int n = 0;
+-  int shift;
+-
+-  while (*tag != 0)
+-    {
+-      b[n++] = *tag++;
+-    }
+-
+-  b[n++] = '=';
+-
+-  for (shift = 28; shift >= 0; shift -= 4)
+-    {
+-      b[n++] = hex[(v >> shift) & 15];
+-    }
+-
+-  b[n++] = 0x0d;
+-  b[n++] = 0x0a;
+-  b[n]   = 0;
+-
+-  stmp3770_lcdcon_puts(b);
++  stmp3770_lcdcon_puts(s);
++  stmp3770_lcdcon_puts("\r\n");
+ }
+ 
+ /* 打一个十进制数（带标签）到 LCD 控制台。 */
+@@ -263,67 +238,250 @@ static void nand_print_num(FAR const char *tag, uint32_t v)
+   stmp3770_lcdcon_puts(b);
+ }
+ 
+-/* 只读冒烟测试：初始化 GPMI/ECC8，打印 ID 与几何，再读几页。
+- * 绝不写 NAND —— 真机上存的是原厂固件，写坏了要整片回刷。 */
++/* 原厂在 0 号块和 4 号块各存了一份 NCB（NAND 控制块），两份内容逐字节
++ * 相同。4 号块那份一旦被抹掉，就从 0 号块复制回去（数据 + 19 字节元数据），
++ * 并读回复核。返回 0=本来就正常，1=已修复，负值=修复失败。
++ */
++
++static int nand_fix_ncb_backup(FAR struct mtd_dev_s *mtd)
++{
++  static uint8_t ncb[HP39GII_NAND_PAGE_SIZE] __attribute__((aligned(32)));
++  static uint8_t rb[HP39GII_NAND_PAGE_SIZE] __attribute__((aligned(32)));
++  static uint8_t meta[16] __attribute__((aligned(32)));
++
++  if (mtd->bread(mtd, (off_t)4 * HP39GII_NAND_PAGES_PBLK, 1, rb) != 1)
++    {
++      return -1;
++    }
++
++  if (rb[0] == 'S' && rb[1] == 'T' && rb[2] == 'M' && rb[3] == 'P')
++    {
++      return 0;
++    }
++
++  if (mtd->bread(mtd, 0, 1, ncb) != 1)
++    {
++      return -2;
++    }
++
++  if (!(ncb[0] == 'S' && ncb[1] == 'T' && ncb[2] == 'M' && ncb[3] == 'P'))
++    {
++      return -3;
++    }
++
++  portMTDReadPage(0, NULL);
++  memcpy(meta, portMTDGetMetaData(), 19);
++
++  if (mtd->erase(mtd, 4, 1) != 1)
++    {
++      return -4;
++    }
++
++  portMTDWritePageMeta(4 * HP39GII_NAND_PAGES_PBLK, ncb, meta);
++  usleep(500);
++
++  if (mtd->bread(mtd, (off_t)4 * HP39GII_NAND_PAGES_PBLK, 1, rb) != 1)
++    {
++      return -5;
++    }
++
++  if (memcmp(ncb, rb, HP39GII_NAND_PAGE_SIZE) != 0)
++    {
++      return -6;
++    }
++
++  portMTDReadPage(4 * HP39GII_NAND_PAGES_PBLK, NULL);
++  if (memcmp(meta, portMTDGetMetaData(), 19) != 0)
++    {
++      return -7;
++    }
++
++  return 1;
++}
++
++/* 文件系统自检：/mnt/boot.txt 存一个十进制计数，每次启动读出来 +1 再写回
++ * 并读回比对。开机号每次 +1 就说明「写进去的数据确实落到了 NAND 上」，
++ * 而不是只活在缓存里。
++ *
++ * 返回新的计数（> 0），失败返回负的 errno。
++ */
++
++static int nand_fs_test(void)
++{
++  char buf[32];
++  char rb[32];
++  int fd;
++  int n;
++  int len;
++  int val = 0;
++
++  fd = open("/mnt/boot.txt", O_RDONLY);
++  if (fd >= 0)
++    {
++      n = read(fd, buf, sizeof(buf) - 1);
++      close(fd);
++      if (n > 0)
++        {
++          buf[n] = '\0';
++          val = atoi(buf);
++        }
++    }
++
++  val++;
++
++  fd = open("/mnt/boot.txt", O_WRONLY | O_CREAT | O_TRUNC, 0666);
++  if (fd < 0)
++    {
++      return -errno;
++    }
++
++  len = snprintf(buf, sizeof(buf), "%d\n", val);
++  n = write(fd, buf, len);
++  close(fd);
++  if (n != len)
++    {
++      return -5;
++    }
++
++  fd = open("/mnt/boot.txt", O_RDONLY);
++  if (fd < 0)
++    {
++      return -errno;
++    }
++
++  n = read(fd, rb, sizeof(rb) - 1);
++  close(fd);
++
++  if (n != len || memcmp(buf, rb, len) != 0)
++    {
++      return -6;
++    }
++
++  return val;
++}
++
++/* NAND + 文件系统 bring-up。放在低优先级内核线程里跑：GPMI 的读写都是
++ * 轮询等待，SmartFS 挂载时还要扫一遍卷头（约几秒），不能挡在启动路径上。 */
+ 
+ static int hp39gii_nand_thread(int argc, char **argv)
+ {
+   FAR struct mtd_dev_s *mtd;
++  FAR struct mtd_dev_s *part;
+   struct mtd_geometry_s geo;
+-  FAR const uint8_t *id;
+-  uint32_t st[13];
+-  extern FAR const uint8_t *stmp3770_nand_id(void);
+-  extern void stmp3770_nand_stats(FAR uint32_t *out);
+-  static uint8_t pagebuf[8192] __attribute__((aligned(4)));
++  static uint8_t pagebuf[HP39GII_NAND_PAGE_SIZE]
++      __attribute__((aligned(32)));
++  int ret;
+ 
+   memset(&geo, 0, sizeof(geo));
+ 
+   sleep(3);
+ 
+-  stmp3770_lcdcon_puts("NAND init...\r\n");
++  nand_put("NAND init...");
+ 
+   mtd = stmp3770_nand_initialize();
+   if (mtd == NULL)
+     {
+-      stmp3770_lcdcon_puts("NAND init FAILED\r\n");
++      nand_put("NAND init FAILED");
+       return -1;
+     }
+ 
+-  stmp3770_lcdcon_puts("NAND init OK\r\n");
++  ret = mtd->ioctl(mtd, MTDIOC_GEOMETRY, (unsigned long)&geo);
++  if (ret < 0)
++    {
++      nand_put("NAND geometry FAILED");
++      return -1;
++    }
+ 
+-  id = stmp3770_nand_id();
+-  nand_hex_line("id    ", id, 6);
++  if (geo.blocksize != HP39GII_NAND_PAGE_SIZE ||
++      geo.erasesize != HP39GII_NAND_PAGE_SIZE * HP39GII_NAND_PAGES_PBLK ||
++      geo.neraseblocks < 1024)
++    {
++      nand_put("NAND geometry BAD");
++      return -1;
++    }
++
++  nand_put("NAND init OK");
+ 
+-  if (mtd->ioctl(mtd, MTDIOC_GEOMETRY, (unsigned long)&geo) == OK)
++  /* 原厂区只读检查：page 0 必须还是 STMP 引导记录 */
++
++  if (mtd->bread(mtd, 0, 1, pagebuf) == 1 &&
++      pagebuf[0] == 'S' && pagebuf[1] == 'T' &&
++      pagebuf[2] == 'M' && pagebuf[3] == 'P')
++    {
++      nand_put("stock p0 OK");
++    }
++  else
+     {
+-      nand_print_num("blk   ", (uint32_t)geo.blocksize);
+-      nand_print_num("erase ", (uint32_t)geo.erasesize);
+-      nand_print_num("count ", (uint32_t)geo.neraseblocks);
++      nand_put("stock p0 BAD");
+     }
+ 
+-  if (geo.blocksize == 0 || geo.blocksize > sizeof(pagebuf))
++  /* 4 号块的 NCB 备份自愈（只动 4 号块，且只在它坏了的时候动） */
++
++  ret = nand_fix_ncb_backup(mtd);
++  if (ret == 0)
+     {
+-      stmp3770_lcdcon_puts("bad geometry, stop\r\n");
+-      return 0;
++      nand_put("ncb backup OK");
++    }
++  else if (ret == 1)
++    {
++      nand_put("ncb backup RESTORED");
++    }
++  else
++    {
++      nand_put("ncb backup FIX FAILED");
++      nand_print_num("err ", (uint32_t)-ret);
+     }
+ 
+-  stmp3770_lcdcon_puts("read p0\r\n");
+-  mtd->bread(mtd, 0, 1, pagebuf);
+-  nand_hex_line("p0    ", pagebuf, 16);
++  /* 只把我们自己的那块切出来给文件系统用 */
+ 
+-  stmp3770_lcdcon_puts(pagebuf[0] == 0x53 && pagebuf[1] == 0x54 &&
+-                       pagebuf[2] == 0x4d && pagebuf[3] == 0x50 ?
+-                       "STMP magic OK\r\n" : "STMP magic BAD\r\n");
++  /* 注意：mtd_partition() 的 firstblock/nblocks 以「读写块」（这里就是页）为
++   * 单位，不是擦除块。第一版按擦除块传，结果分区被算到 4 号块（原厂 NCB 的
++   * 备份块）上，mksmartfs 一格式化就把那个备份块擦了 —— 已由下面的
++   * nand_fix_ncb_backup() 从 0 号块复制回来。
++   */
+ 
+-  stmp3770_lcdcon_puts("read p1\r\n");
+-  mtd->bread(mtd, 1, 1, pagebuf);
+-  nand_hex_line("p1    ", pagebuf, 16);
++  part = mtd_partition(mtd,
++                       (off_t)HP39GII_NAND_FS_FIRST * HP39GII_NAND_PAGES_PBLK,
++                       (off_t)HP39GII_NAND_FS_BLOCKS * HP39GII_NAND_PAGES_PBLK);
++  if (part == NULL)
++    {
++      nand_put("partition FAILED");
++      return -1;
++    }
+ 
+-  stmp3770_lcdcon_puts("read p1984\r\n");
+-  mtd->bread(mtd, 1984, 1, pagebuf);
+-  nand_hex_line("p1984 ", pagebuf, 16);
++  ret = smart_initialize(0, part, NULL);
++  if (ret < 0)
++    {
++      nand_put("smart init FAILED");
++      nand_print_num("err ", (uint32_t)-ret);
++      return -1;
++    }
++
++  nand_put("smart0 ready");
++
++  mkdir("/mnt", 0777);
++  ret = mount("/dev/smart0", "/mnt", "smartfs", 0, NULL);
++  if (ret < 0)
++    {
++      nand_put("mount FAILED (unformatted?)");
++      nand_print_num("errno ", (uint32_t)errno);
++      nand_put("run: mksmartfs /dev/smart0");
++      return 0;
++    }
++
++  nand_put("mounted /mnt");
++
++  ret = nand_fs_test();
++  if (ret > 0)
++    {
++      nand_print_num("boot# ", (uint32_t)ret);
++    }
++  else
++    {
++      nand_put("file test FAILED");
++      nand_print_num("err ", (uint32_t)-ret);
++    }
+ 
+-  stmp3770_lcdcon_puts("NAND done\r\n");
+   return 0;
+ }
+ 

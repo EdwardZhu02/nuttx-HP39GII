@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+"""
+kconfig-tweak, minimal stand-in.
+
+NuttX's tools/configure.sh calls tools/sethost.sh, which calls kconfig-tweak to
+rewrite the host-selection lines in .config. kconfig-tweak ships with
+kconfig-frontends, which recent distributions no longer package, and building
+kconfig-frontends pulls in autotools plus ncurses for a program whose only job
+here is to flip three lines.
+
+This implements the subset NuttX actually uses:
+
+  kconfig-tweak --file .config --enable  CONFIG_FOO
+  kconfig-tweak --file .config --disable CONFIG_FOO
+  kconfig-tweak --file .config --set-val CONFIG_FOO 42
+  kconfig-tweak --file .config --undefine CONFIG_FOO
+
+If real kconfig-frontends is installed, scripts/build-nuttx.sh uses it and this
+file is never reached.
+"""
+
+import sys
+
+VALID = ("--file", "--enable", "--disable", "--set-val", "--undefine",
+         "--module", "--refresh", "-h", "--help")
+
+
+def usage(code=2):
+    sys.stderr.write(
+        "usage: kconfig-tweak --file <file> [--enable|--disable|--set-val|--undefine ...] SYM [VAL]\n")
+    sys.exit(code)
+
+
+def main(argv):
+    path = None
+    ops = []          # (kind, symbol, value)
+
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-h", "--help"):
+            usage(0)
+        elif a == "--file":
+            i += 1
+            if i >= len(argv):
+                usage()
+            path = argv[i]
+        elif a == "--refresh":
+            pass
+        elif a in ("--enable", "--disable", "--undefine", "--module"):
+            i += 1
+            if i >= len(argv):
+                usage()
+            ops.append((a, argv[i], None))
+        elif a == "--set-val":
+            if i + 2 >= len(argv):
+                usage()
+            ops.append((a, argv[i + 1], argv[i + 2]))
+            i += 1
+        else:
+            usage()
+        i += 1
+
+    if not path or not ops:
+        usage()
+
+    with open(path, "r") as f:
+        lines = f.read().splitlines()
+
+    def find(sym):
+        for n, line in enumerate(lines):
+            s = line.strip()
+            if s.startswith(sym + "=") or s == "# %s is not set" % sym:
+                return n
+        return -1
+
+    for kind, sym, val in ops:
+        n = find(sym)
+        if kind == "--enable":
+            new = "%s=y" % sym
+        elif kind == "--module":
+            new = "%s=m" % sym
+        elif kind == "--set-val":
+            new = "%s=%s" % (sym, val)
+        elif kind == "--disable":
+            new = "# %s is not set" % sym
+        else:                     # --undefine
+            new = None
+
+        if n >= 0:
+            if new is None:
+                del lines[n]
+            else:
+                lines[n] = new
+        elif new is not None:
+            lines.append(new)
+
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,208 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: edwardzhu02 <explodingtnt@foxmail.com>
+Date: Sun, 1 Nov 2026 16:21:45 +0800
+Subject: [PATCH] stmp3770/hp39gii: add NuttX MTD adapter over the GPMI NAND
+ driver
+
+Wrap the portMTD* GPMI interface in a standard struct mtd_dev_s so
+SmartFS/LittleFS/FTL can mount the 128MB NAND. Geometry: 2048B blocks,
+128KB erase blocks, 1024 erase blocks. Read/write/erase are synchronous
+(the GPMI driver polls APBH DEBUG2 + a probe byte internally).
+---
+ arch/arm/src/stmp3770/Make.defs      |   2 +-
+ arch/arm/src/stmp3770/STATUS.md      |  17 +++-
+ arch/arm/src/stmp3770/stmp3770_mtd.c | 141 +++++++++++++++++++++++++++
+ 3 files changed, 158 insertions(+), 2 deletions(-)
+ create mode 100644 arch/arm/src/stmp3770/stmp3770_mtd.c
+
+diff --git a/arch/arm/src/stmp3770/Make.defs b/arch/arm/src/stmp3770/Make.defs
+index fc5ba2d6..15cb0a6a 100644
+--- a/arch/arm/src/stmp3770/Make.defs
++++ b/arch/arm/src/stmp3770/Make.defs
+@@ -31,5 +31,5 @@ CHIP_CSRCS += stmp3770_kbd.c
+ endif
+ 
+ ifeq ($(CONFIG_STMP3770_NAND),y)
+-CHIP_CSRCS += stmp3770_gpmi.c
++CHIP_CSRCS += stmp3770_gpmi.c stmp3770_mtd.c
+ endif
+diff --git a/arch/arm/src/stmp3770/STATUS.md b/arch/arm/src/stmp3770/STATUS.md
+index 4de23199..6a759a86 100644
+--- a/arch/arm/src/stmp3770/STATUS.md
++++ b/arch/arm/src/stmp3770/STATUS.md
+@@ -93,12 +93,27 @@ ECHO/ICANON/ICRNL，`uart_readv` 因此走 raw 路径（不回显、不拼行）
+ 修法：`arm_serialinit()` 先 `pl011_earlyserialinit()` 再 `pl011_serialinit()`。
+ 修好后注入 `hello\r` 实测 NSH 正确回显并解析：`hello` / `nsh: hello: command not found`。
+ 
++## GPMI + ECC8 NAND 驱动（2026-11-01 第四轮）
++
++从 ExistOS `stmp_gpmi.c` 移植，读/写/擦已在 EmuGII 里对真机 128MB dump 验证：
++
++- `stmp3770_gpmi.c`：APBH 通道 4 的 DMA 描述符链 + 页读/写/擦/拷贝 + 0x90 闪存 ID
++  几何探测（2048B 页 / 64B spare / 64 页/块 / 1024 块）。
++- ISR 用 `irq_attach` 挂（GPMI / GPMI_DMA / ECC8），三个适配器包一层签名。
++- **GPMI_PowerUp()**：清 GPMI_CTRL0 + ECC8_CTRL 的 SFTRST/CLKGATE（ECC8 还多一个
++  AHBM_SFTRST）。和 LCD 的 APBH 上电是同一类坑——不清晰控制器保持复位，所有访问
++  静默卡死。
++- 验证：page0 读回 `STMP-...` BootStream 魔数、page1984 与 System 镜像逐字节一致，
++  写 0x5A 后读回一致。
++
++下一步是 NuttX MTD 封装（把 portMTD* 包成 `struct mtd_dev_s`）+ 文件系统（LittleFS/SmartFS）。
++
+ ## 下一步
+ 
+ 1. ~~键盘矩阵~~ ✅ 扫描/翻译/ECHO 验证 + 控制台注入回显/解析全部打通
+ 2. LCDIF 的 ISR（`STMP3770_IRQ_LCDIF_DMA` 源 45），把帧写入的轮询判完成换成信号量
+ 3. 面板像素对齐：现在横条内部有细碎噪点，怀疑是每行只写 256 字节、面板实际 258 列
+-4. GPMI + ECC8 NAND（最难）
++4. ~~GPMI + ECC8 NAND~~ ✅ 读/写/擦已在 EmuGII 对真机 128MB dump 验证（page0=STMP 魔数一致）
+ 5. 真机验证：`nuttx.sb` 经 SDP 载入（真机无外露串口，需要先有面板输出——现在已经有了）
+ 
+ ## 环境备忘
+diff --git a/arch/arm/src/stmp3770/stmp3770_mtd.c b/arch/arm/src/stmp3770/stmp3770_mtd.c
+new file mode 100644
+index 00000000..b11960af
+--- /dev/null
++++ b/arch/arm/src/stmp3770/stmp3770_mtd.c
+@@ -0,0 +1,141 @@
++/****************************************************************************
++ * arch/arm/src/stmp3770/stmp3770_mtd.c
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * 把 ExistOS 移植来的 GPMI NAND 驱动（stmp3770_gpmi.c 的 portMTD* 接口）
++ * 包成 NuttX 标准的 struct mtd_dev_s，供 SmartFS / LittleFS / FTL 等挂载。
++ *
++ * 几何：页 2048 B / 块 64 页 (128 KB) / 1024 块 = 128 MB。
++ * GPMI 的读/写/擦都是同步的（内部轮询 APBH DEBUG2 + 探针字节），所以这里
++ * 直接调用，不需要额外的信号量。
++ ****************************************************************************/
++
++#include <nuttx/config.h>
++#include <nuttx/kmalloc.h>
++#include <nuttx/mtd/mtd.h>
++
++#include <errno.h>
++#include <string.h>
++
++#include "mtd_up.h"
++
++#ifdef CONFIG_STMP3770_NAND
++
++struct stmp3770_mtd_dev_s
++{
++  struct mtd_dev_s mtd;
++  mtdInfo_t info;
++};
++
++static int stmp3770_mtd_erase(FAR struct mtd_dev_s *dev, off_t startblock,
++                              size_t nblocks)
++{
++  size_t i;
++
++  for (i = 0; i < nblocks; i++)
++    {
++      portMTDEraseBlock((uint32_t)(startblock + i));
++    }
++
++  return nblocks;
++}
++
++static ssize_t stmp3770_mtd_bread(FAR struct mtd_dev_s *dev, off_t startblock,
++                                  size_t nblocks, FAR uint8_t *buffer)
++{
++  FAR struct stmp3770_mtd_dev_s *priv =
++      (FAR struct stmp3770_mtd_dev_s *)dev;
++  size_t i;
++
++  for (i = 0; i < nblocks; i++)
++    {
++      portMTDReadPage((uint32_t)(startblock + i),
++                      buffer + i * priv->info.PageSize_B);
++    }
++
++  return (ssize_t)(nblocks * priv->info.PageSize_B);
++}
++
++static ssize_t stmp3770_mtd_bwrite(FAR struct mtd_dev_s *dev,
++                                   off_t startblock, size_t nblocks,
++                                   FAR const uint8_t *buffer)
++{
++  FAR struct stmp3770_mtd_dev_s *priv =
++      (FAR struct stmp3770_mtd_dev_s *)dev;
++  size_t i;
++
++  for (i = 0; i < nblocks; i++)
++    {
++      portMTDWritePage((uint32_t)(startblock + i),
++                       (uint8_t *)(buffer + i * priv->info.PageSize_B));
++    }
++
++  return (ssize_t)(nblocks * priv->info.PageSize_B);
++}
++
++static int stmp3770_mtd_ioctl(FAR struct mtd_dev_s *dev, int cmd,
++                              unsigned long arg)
++{
++  FAR struct stmp3770_mtd_dev_s *priv =
++      (FAR struct stmp3770_mtd_dev_s *)dev;
++
++  switch (cmd)
++    {
++      case MTDIOC_GEOMETRY:
++        {
++          FAR struct mtd_geometry_s *geo =
++              (FAR struct mtd_geometry_s *)arg;
++
++          geo->blocksize    = priv->info.PageSize_B;
++          geo->erasesize    = priv->info.BlockSize_KB * 1024;
++          geo->neraseblocks = priv->info.Blocks;
++          strlcpy(geo->model, "stmp3770-nand", sizeof(geo->model));
++          return OK;
++        }
++
++      case MTDIOC_BULKERASE:
++        {
++          uint32_t b;
++
++          for (b = 0; b < priv->info.Blocks; b++)
++            {
++              portMTDEraseBlock(b);
++            }
++
++          return OK;
++        }
++
++      default:
++        return -ENOTTY;
++    }
++}
++
++/****************************************************************************
++ * Public Functions
++ ****************************************************************************/
++
++FAR struct mtd_dev_s *stmp3770_nand_initialize(void)
++{
++  FAR struct stmp3770_mtd_dev_s *priv;
++
++  priv = kmm_zalloc(sizeof(struct stmp3770_mtd_dev_s));
++  if (priv == NULL)
++    {
++      return NULL;
++    }
++
++  portMTDInterfaceInit();
++  portMTDDeviceInit(&priv->info);
++
++  priv->mtd.erase  = stmp3770_mtd_erase;
++  priv->mtd.bread  = stmp3770_mtd_bread;
++  priv->mtd.bwrite = stmp3770_mtd_bwrite;
++  priv->mtd.ioctl  = stmp3770_mtd_ioctl;
++
++  priv->mtd.name = "stmp3770-nand";
++
++  return &priv->mtd;
++}
++
++#endif /* CONFIG_STMP3770_NAND */

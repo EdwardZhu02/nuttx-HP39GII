@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: edwardzhu02 <explodingtnt@foxmail.com>
+Date: Sun, 1 Nov 2026 22:00:06 +0800
+Subject: [PATCH] nshlib: add the clear command
+
+Writes ESC[H ESC[2J, which the STMP3770 LCD console implements and a real
+serial terminal understands as home + erase display.
+---
+ nshlib/nsh.h         |  4 ++++
+ nshlib/nsh_command.c |  4 ++++
+ nshlib/nsh_syscmds.c | 19 +++++++++++++++++++
+ 3 files changed, 27 insertions(+)
+
+diff --git a/nshlib/nsh.h b/nshlib/nsh.h
+index 1f98d4b..5a7d557 100644
+--- a/nshlib/nsh.h
++++ b/nshlib/nsh.h
+@@ -1092,6 +1092,10 @@ int cmd_irqinfo(FAR struct nsh_vtbl_s *vtbl, int argc, FAR char **argv);
+   int cmd_pwd(FAR struct nsh_vtbl_s *vtbl, int argc, FAR char **argv);
+ #endif
+ 
++#ifndef CONFIG_NSH_DISABLE_CLEAR
++  int cmd_clear(FAR struct nsh_vtbl_s *vtbl, int argc, FAR char **argv);
++#endif
++
+ #ifndef CONFIG_NSH_DISABLE_ENV
+   int cmd_env(FAR struct nsh_vtbl_s *vtbl, int argc, FAR char **argv);
+ #endif
+diff --git a/nshlib/nsh_command.c b/nshlib/nsh_command.c
+index d4e3654..4af4ab0 100644
+--- a/nshlib/nsh_command.c
++++ b/nshlib/nsh_command.c
+@@ -181,6 +181,10 @@ static const struct cmdmap_s g_cmdmap[] =
+   CMD_MAP("chown",    cmd_chown,    3, 3, "[<uid>][:<gid>] <path>"),
+ #endif
+ 
++#ifndef CONFIG_NSH_DISABLE_CLEAR
++  CMD_MAP("clear",    cmd_clear,    1, 1, NULL),
++#endif
++
+ #ifndef CONFIG_NSH_DISABLE_CP
+   CMD_MAP("cp",       cmd_cp,       3, 4, "[-r] <source-path> <dest-path>"),
+ #endif
+diff --git a/nshlib/nsh_syscmds.c b/nshlib/nsh_syscmds.c
+index 34059be..9364856 100644
+--- a/nshlib/nsh_syscmds.c
++++ b/nshlib/nsh_syscmds.c
+@@ -805,6 +805,25 @@ int cmd_rptun(FAR struct nsh_vtbl_s *vtbl, int argc, FAR char **argv)
+  ****************************************************************************/
+ 
+ #ifndef CONFIG_NSH_DISABLE_UNAME
++/****************************************************************************
++ * Name: cmd_clear
++ ****************************************************************************/
++
++#ifndef CONFIG_NSH_DISABLE_CLEAR
++int cmd_clear(FAR struct nsh_vtbl_s *vtbl, int argc, FAR char **argv)
++{
++  UNUSED(argc);
++  UNUSED(argv);
++
++  /* ANSI home + erase display.  The LCD console implements ESC[H and ESC[2J;
++   * a real serial terminal understands them as well.
++   */
++
++  nsh_write(vtbl, "\033[H\033[2J", 7);
++  return OK;
++}
++#endif
++
+ int cmd_uname(FAR struct nsh_vtbl_s *vtbl, int argc, FAR char **argv)
+ {
+   FAR const char *str;

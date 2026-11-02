@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: edwardzhu02 <explodingtnt@foxmail.com>
+Date: Sun, 1 Nov 2026 22:27:13 +0800
+Subject: [PATCH] stmp3770: run the GPMI from HF (PLL/2) like ExistOS
+
+With the pin mux in place the NAND bus came alive on hardware: page 0 and
+page 1984 read back the same bytes as the 128 MB backup, but every read
+started one byte late (page 0 gave 54 4d 50 2d instead of 53 54 4d 50).
+
+The descriptors and timing constants are identical to ExistOS, so the
+remaining difference is the GPMI clock source: we had it on the 24 MHz
+crystal, ExistOS runs it at HF (PLL 480 MHz / 2) with GPMIFreq 240 MHz.
+The BootROM leaves the PLL powered (PLLCTRL0.POWER set), so switch back
+to that setting.
+---
+ arch/arm/src/stmp3770/stmp3770_gpmi.c | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/arch/arm/src/stmp3770/stmp3770_gpmi.c b/arch/arm/src/stmp3770/stmp3770_gpmi.c
+index 6313f68c..122d9c0a 100644
+--- a/arch/arm/src/stmp3770/stmp3770_gpmi.c
++++ b/arch/arm/src/stmp3770/stmp3770_gpmi.c
+@@ -163,12 +163,13 @@ static void GPMI_ClockConfigure()
+     HW_CLKCTRL_GPMI_WR(BF_CLKCTRL_GPMI_DIV(2));
+     INFO("GPMI CLK DIV:%d\n", BF_RD(CLKCTRL_GPMI, DIV));
+ 
+-    /* 真机上没有跑 stmp3770_clockconfig()（会卡死芯片），PLL 状态未知。
+-     * GPMI 直接旁路到 24 MHz 晶振，时序常数按 24 MHz 算，慢但一定能跑。 */
++    /* 与 ExistOS 一致：走 HF（PLL 480 MHz / 2）。BootROM 已经把 PLL 上电
++     * （PLLCTRL0.POWER=1）。真机上按 24 MHz 晶振算时序时，读回来的数据整体
++     * 错开一个字节（采样点对不上），所以必须用 PLL 这个时钟域。 */
+ 
+-    BF_SET(CLKCTRL_CLKSEQ, BYPASS_GPMI);
++    BF_CLR(CLKCTRL_CLKSEQ, BYPASS_GPMI);
+ 
+-    GPMIFreq = 24000000ULL;
++    GPMIFreq = 480000000ULL / 2ULL;
+ 
+ 
+ }

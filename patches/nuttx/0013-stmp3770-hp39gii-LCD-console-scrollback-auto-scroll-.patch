@@ -1,0 +1,573 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: edwardzhu02 <explodingtnt@foxmail.com>
+Date: Sun, 1 Nov 2026 22:00:27 +0800
+Subject: [PATCH] stmp3770/hp39gii: LCD console scrollback, auto-scroll and
+ clear
+
+- Keep the console text in a 128-line ring buffer instead of a single
+  16-row framebuffer, so the screen becomes a view over it.  The old
+  scroll only moved g_fb and never re-flushed the panel, which is why
+  output stopped updating once it filled the screen.
+- Arrow keys scroll the view: up/down one line, left/right one page.
+  New output jumps back to the bottom.
+- Batch panel flushes: putc marks dirty rows only; the batch is flushed
+  once per read()/write()/puts() instead of 8 rows per character.
+- Implement ANSI ESC[2J (erase display) and ESC[H (home); ESC[K now also
+  erases the line tail in the text buffer, not just on the panel.
+
+Verified in EmuGII: 16 numbered lines render correctly, output overflow
+auto-scrolls, scroll_view(-5) shows the previous five lines, and the NSH
+clear command blanks the screen.
+---
+ arch/arm/src/stmp3770/stmp3770_lcdcon.c       | 344 +++++++++++++++---
+ arch/arm/src/stmp3770/stmp3770_lcdcon.h       |   5 +-
+ boards/arm/stmp3770/hp39gii/src/hp39gii_kbd.c |  30 +-
+ 3 files changed, 305 insertions(+), 74 deletions(-)
+
+diff --git a/arch/arm/src/stmp3770/stmp3770_lcdcon.c b/arch/arm/src/stmp3770/stmp3770_lcdcon.c
+index 41bd7f3d..7425bb1a 100644
+--- a/arch/arm/src/stmp3770/stmp3770_lcdcon.c
++++ b/arch/arm/src/stmp3770/stmp3770_lcdcon.c
+@@ -1,5 +1,6 @@
+ #include <nuttx/config.h>
+ #include <stdint.h>
++#include <stdbool.h>
+ #include <string.h>
+ #include "stmp3770_lcdcon.h"
+ #include <nuttx/fs/fs.h>
+@@ -114,9 +115,27 @@ static const uint8_t g_font[95][8] =
+ 
+ /* text framebuffer: 1 byte per pixel, 0x00 = dark/on */
+ static uint8_t g_fb[W * H];
+-static int g_curx;
+-static int g_cury;
+-static int g_esc;   /* ANSI 转义状态：0=普通 1=收到 ESC 2=CSI */
++
++/* 文本按「行」保存，屏幕只是其中 ROWS 行的视图；这样才有回滚。
++ * g_sb 是环形缓冲，绝对行号 abs 存在 g_sb[abs % SB_LINES]。
++ */
++
++#define SB_LINES 128
++
++static char g_sb[SB_LINES][COLS];
++static int  g_ntotal;   /* 已产生过的行数（>= 1） */
++static int  g_line;     /* 光标所在行（绝对行号） */
++static int  g_col;      /* 光标列 */
++static int  g_top;      /* 屏幕第一行的绝对行号 */
++static bool g_follow;   /* 视图是否停在底部（跟随输出） */
++static int  g_esc;      /* ANSI 转义状态：0=普通 1=收到 ESC 2=CSI */
++
++/* 一批写操作（一次 write/一次回显）只刷一次面板：逐字符刷 8 行太贵。
++ * g_dirty0 > g_dirty1 表示没有待刷新的行。
++ */
++
++static int  g_dirty0 = 0;
++static int  g_dirty1 = -1;
+ 
+ /* 把 g_fb 里的一块区域逐行刷到面板（portDispFlushAreaBuf 一次只吃一行
+  * 连续字节）。x/y 都是面板可见区坐标（0..255 / 0..127）。
+@@ -139,36 +158,75 @@ static void lcd_flush_region(uint32_t x0, uint32_t y0,
+     }
+ }
+ 
+-void stmp3770_lcdcon_clear(void)
++static void lcdcon_mark_dirty(int y0, int y1)
+ {
+-  memset(g_fb, 0xff, sizeof(g_fb));
+-  g_esc  = 0;
+-  g_curx = 0;
+-  g_cury = 0;
+-  lcd_flush_region(0, 0, W - 1, H - 1);
+-}
++  if (y0 < 0)
++    {
++      y0 = 0;
++    }
+ 
+-static void lcdcon_scroll(void)
+-{
+-  memmove(g_fb, g_fb + 8 * W, (H - 8) * W);
+-  memset(g_fb + (H - 8) * W, 0xff, 8 * W);
++  if (y1 >= H)
++    {
++      y1 = H - 1;
++    }
++
++  if (g_dirty0 > g_dirty1)
++    {
++      g_dirty0 = y0;
++      g_dirty1 = y1;
++    }
++  else
++    {
++      if (y0 < g_dirty0)
++        {
++          g_dirty0 = y0;
++        }
++
++      if (y1 > g_dirty1)
++        {
++          g_dirty1 = y1;
++        }
++    }
+ }
+ 
+-static void lcdcon_newline(void)
++/* 把累积的改动刷到面板。 */
++
++static void lcd_flush_dirty(void)
+ {
+-  g_curx = 0;
+-  if (++g_cury >= ROWS)
++  if (g_dirty0 > g_dirty1)
+     {
+-      g_cury = ROWS - 1;
+-      lcdcon_scroll();
++      return;
+     }
++
++  lcd_flush_region(0, g_dirty0, W - 1, g_dirty1);
++  g_dirty0 = 0;
++  g_dirty1 = -1;
++}
++
++static char *lcdcon_line(int abs)
++{
++  return g_sb[abs % SB_LINES];
++}
++
++/* 屏幕顶部最靠下的位置（即显示最后 ROWS 行时） */
++static int lcdcon_max_top(void)
++{
++  int m = g_ntotal - ROWS;
++  return m > 0 ? m : 0;
++}
++
++/* 回滚缓冲里还留得最旧的一行 */
++static int lcdcon_min_top(void)
++{
++  int m = g_ntotal - SB_LINES;
++  return m > 0 ? m : 0;
+ }
+ 
+-static void lcdcon_draw_char(int ch)
++static void lcdcon_blit(int row, int col, int ch)
+ {
+   const uint8_t *glyph;
+-  int x0 = g_curx * 8;
+-  int y0 = g_cury * 8;
++  int x0 = col * 8;
++  int y0 = row * 8;
+   int r;
+   int c;
+ 
+@@ -188,63 +246,194 @@ static void lcdcon_draw_char(int ch)
+         }
+     }
+ 
+-  lcd_flush_region(x0, y0, x0 + 7, y0 + 7);
++  lcdcon_mark_dirty(y0, y0 + 7);
++}
++
++static void lcdcon_blit_line(int row, const char *ln)
++{
++  int c;
++
++  for (c = 0; c < COLS; c++)
++    {
++      lcdcon_blit(row, c, ln[c]);
++    }
+ }
+ 
+-/* 诊断用：在右下角固定格子画一个字符，不动控制台光标。
+- * 用来把「键盘到驱动」和「NSH 回显」分开观察。 */
++/* 整屏重画：渲染 [g_top, g_top+ROWS) 行，然后把整屏刷下去。 */
+ 
+-void stmp3770_lcdcon_keymark(int ch)
++static void lcdcon_render(void)
++{
++  int r;
++
++  memset(g_fb, 0xff, sizeof(g_fb));
++
++  for (r = 0; r < ROWS; r++)
++    {
++      int abs = g_top + r;
++
++      if (abs >= g_ntotal)
++        {
++          break;
++        }
++
++      lcdcon_blit_line(r, lcdcon_line(abs));
++    }
++
++  g_dirty0 = 0;
++  g_dirty1 = H - 1;
++}
++
++/* 清空文本缓冲与回滚历史（不重画）。 */
++
++static void lcdcon_reset(void)
+ {
+-  const uint8_t *glyph;
+-  int x0 = (COLS - 1) * 8;
+-  int y0 = (ROWS - 1) * 8;
+   int r;
+   int c;
+ 
+-  if (ch < 32 || ch > 126)
++  for (r = 0; r < SB_LINES; r++)
+     {
+-      ch = 0x2e;
++      for (c = 0; c < COLS; c++)
++        {
++          g_sb[r][c] = ' ';
++        }
+     }
+ 
+-  glyph = g_font[ch - 32];
+-  for (r = 0; r < 8; r++)
++  g_ntotal = 1;
++  g_line   = 0;
++  g_col    = 0;
++  g_top    = 0;
++  g_follow = true;
++  g_esc    = 0;
++}
++
++void stmp3770_lcdcon_clear(void)
++{
++  lcdcon_reset();
++  lcdcon_render();
++  lcd_flush_dirty();
++}
++
++static bool lcdcon_visible(void)
++{
++  return g_line >= g_top && g_line < g_top + ROWS;
++}
++
++/* 有新输出时回到屏幕底部（用户往回翻看后，一旦有新内容就跳回最新）。 */
++
++static void lcdcon_follow(void)
++{
++  if (!g_follow)
+     {
+-      uint8_t bits = glyph[r];
+-      for (c = 0; c < 8; c++)
++      g_follow = true;
++      g_top    = lcdcon_max_top();
++      lcdcon_render();
++    }
++}
++
++static void lcdcon_newline(void)
++{
++  g_col = 0;
++  g_line++;
++
++  if (g_line >= g_ntotal)
++    {
++      char *ln = lcdcon_line(g_line);
++      int c;
++
++      for (c = 0; c < COLS; c++)
+         {
+-          g_fb[(y0 + r) * W + (x0 + c)] =
+-              (bits & (0x80 >> c)) ? 0x00 : 0xff;
++          ln[c] = ' ';
+         }
++
++      g_ntotal = g_line + 1;
++    }
++
++  if (g_follow)
++    {
++      int mt = lcdcon_max_top();
++
++      if (g_top < mt)
++        {
++          /* 到底了：整屏上滚一行。之前只改了 g_fb 没有回刷面板，
++           * 所以真机上输出满屏后画面再也不动。 */
++
++          g_top = mt;
++          lcdcon_render();
++          lcd_flush_dirty();
++        }
++    }
++}
++
++/* 回滚/前进：lines > 0 向新内容，< 0 向旧内容。 */
++
++void stmp3770_lcdcon_scroll_view(int lines)
++{
++  int max = lcdcon_max_top();
++  int min = lcdcon_min_top();
++  int t   = g_top + lines;
++
++  if (t > max)
++    {
++      t = max;
++    }
++
++  if (t < min)
++    {
++      t = min;
+     }
+ 
+-  lcd_flush_region(x0, y0, x0 + 7, y0 + 7);
++  if (t == g_top)
++    {
++      return;
++    }
++
++  g_top    = t;
++  g_follow = (t == max);
++  lcdcon_render();
++  lcd_flush_dirty();
+ }
+ 
+ /* 擦掉光标到行尾的内容（对应终端 ESC[K）。 */
+ 
+ static void lcdcon_erase_eol(void)
+ {
+-  int y0 = g_cury * 8;
+-  int x0 = g_curx * 8;
+-  int r;
++  char *ln = lcdcon_line(g_line);
+   int c;
+ 
+-  for (r = 0; r < 8; r++)
++  for (c = g_col; c < COLS; c++)
+     {
+-      for (c = x0; c < W; c++)
+-        {
+-          g_fb[(y0 + r) * W + c] = 0xff;
+-        }
++      ln[c] = ' ';
++    }
++
++  if (lcdcon_visible())
++    {
++      int row = g_line - g_top;
++
++      lcdcon_blit_line(row, ln);
+     }
++}
++
++/* 清屏（ESC[2J），回滚历史一起清掉。 */
++
++static void lcdcon_erase_screen(void)
++{
++  lcdcon_reset();
++  lcdcon_render();
++  lcd_flush_dirty();
++}
++
++/* 光标归位（ESC[H）：屏幕左上角。 */
+ 
+-  lcd_flush_region(x0, y0, W - 1, y0 + 7);
++static void lcdcon_home(void)
++{
++  g_line = g_top;
++  g_col  = 0;
+ }
+ 
+ void stmp3770_lcdcon_putc(int ch)
+ {
+-  /* 吞掉 ANSI 转义序列（readline 会发 ESC[K 等）。
+-   * 不处理光标控制，只保证这些字节不画成 "[K" 之类的乱码。 */
++  /* 吞掉 ANSI 转义序列（readline 会发 ESC[K 等），只实现清屏 / 归位 /
++   * 擦到行尾这几个对终端有用的。 */
+ 
+   if (ch == 0x1b)
+     {
+@@ -264,41 +453,74 @@ void stmp3770_lcdcon_putc(int ch)
+         {
+           g_esc = 0;
+ 
+-          if (ch == 0x4b)               /* ESC[K: 擦到行尾 */
++          if (ch == 0x4b)             /* K */
+             {
+               lcdcon_erase_eol();
+             }
++          else if (ch == 0x4a)        /* J */
++            {
++              lcdcon_erase_screen();
++            }
++          else if (ch == 0x48)        /* H */
++            {
++              lcdcon_home();
++            }
+         }
+ 
+       return;
+     }
+ 
+-  if (ch == '\n')
++  if (ch == 0x0d)
+     {
+-      lcdcon_newline();
++      g_col = 0;
+       return;
+     }
+ 
+-  if (ch == '\r')
++  if (ch == 0x0a)
+     {
+-      g_curx = 0;
++      lcdcon_follow();
++      lcdcon_newline();
+       return;
+     }
+ 
+-  if (ch == 0x08)  /* backspace */
++  if (ch == 0x08)
+     {
+-      if (g_curx > 0)
++      if (g_col > 0)
+         {
+-          g_curx--;
++          g_col--;
+         }
++
++      return;
++    }
++
++  if (ch < 0x20 || ch > 0x7e)
++    {
+       return;
+     }
+ 
+-  lcdcon_draw_char(ch);
+-  if (++g_curx >= COLS)
++  lcdcon_follow();
++
++  if (g_col >= COLS)
+     {
+       lcdcon_newline();
+     }
++
++  {
++    char *ln = lcdcon_line(g_line);
++    int row  = g_line - g_top;
++
++    ln[g_col] = (char)ch;
++
++    if (row >= 0 && row < ROWS)
++      {
++        lcdcon_blit(row, g_col, ch);
++      }
++
++    if (++g_col >= COLS)
++      {
++        lcdcon_newline();
++      }
++  }
+ }
+ 
+ void stmp3770_lcdcon_puts(FAR const char *s)
+@@ -307,6 +529,8 @@ void stmp3770_lcdcon_puts(FAR const char *s)
+     {
+       stmp3770_lcdcon_putc(*s++);
+     }
++
++  lcd_flush_dirty();
+ }
+ 
+ /* 输入环形缓冲：键盘扫描线程把字符 inject 进来，read() 阻塞取出。 */
+@@ -384,6 +608,7 @@ static ssize_t lcdcon_read(FAR struct file *filep, FAR char *buffer,
+       buffer[i++] = ch;
+     }
+ 
++  lcd_flush_dirty();
+   return (ssize_t)i;
+ }
+ 
+@@ -399,6 +624,7 @@ static ssize_t lcdcon_write(FAR struct file *filep,
+       stmp3770_lcdcon_putc(buffer[i]);
+     }
+ 
++  lcd_flush_dirty();
+   return (ssize_t)buflen;
+ }
+ 
+diff --git a/arch/arm/src/stmp3770/stmp3770_lcdcon.h b/arch/arm/src/stmp3770/stmp3770_lcdcon.h
+index bd6a0a36..e9cf8ca4 100644
+--- a/arch/arm/src/stmp3770/stmp3770_lcdcon.h
++++ b/arch/arm/src/stmp3770/stmp3770_lcdcon.h
+@@ -5,11 +5,14 @@
+ 
+ /* 8x8 text console rendered onto the 256x128 LCD. 32 cols x 16 rows. */
+ 
++#define STMP3770_LCDCON_COLS 32
++#define STMP3770_LCDCON_ROWS 16
++
+ void stmp3770_lcdcon_clear(void);
+ void stmp3770_lcdcon_putc(int ch);
+ void stmp3770_lcdcon_puts(FAR const char *s);
+ int stmp3770_lcdcon_initialize(void);
+ void stmp3770_lcdcon_inject(char ch);
+-void stmp3770_lcdcon_keymark(int ch);
++void stmp3770_lcdcon_scroll_view(int lines);
+ 
+ #endif
+diff --git a/boards/arm/stmp3770/hp39gii/src/hp39gii_kbd.c b/boards/arm/stmp3770/hp39gii/src/hp39gii_kbd.c
+index 79421022..5b03c6c4 100644
+--- a/boards/arm/stmp3770/hp39gii/src/hp39gii_kbd.c
++++ b/boards/arm/stmp3770/hp39gii/src/hp39gii_kbd.c
+@@ -172,7 +172,6 @@ static void kbd_deliver(int ch)
+   /* 真机无外露串口：键盘只喂给 LCD 控制台（/dev/lcdcon）。
+    * 右下角标记用来和 NSH 的回显区分：看到标记说明扫描/翻译/投递都到了。 */
+ 
+-  stmp3770_lcdcon_keymark(ch);
+   stmp3770_lcdcon_inject((char)ch);
+ #endif
+ 
+@@ -239,21 +238,25 @@ static void kbd_emit(int keycode)
+ 
+   /* 方向键在这里先不处理：终端转义序列要等控制台通路打通之后再接 */
+ 
++  /* 方向键用来翻看回滚缓冲：上下逐行，左右翻页。不投递给 NSH ——
++   * 这台机器没有外露串口，屏幕就是唯一的观察窗口。 */
++
+   switch (keycode)
+     {
+-      case KBD_KEY(0, 4):   /* UP    */
+-      case KBD_KEY(3, 4):   /* DOWN  */
+-      case KBD_KEY(1, 4):   /* RIGHT */
+-      case KBD_KEY(2, 4):   /* LEFT  */
+-#ifdef CONFIG_STMP3770_KBD_ECHO
+-        /* Direction keys carry no escape sequence yet; emit a placeholder
+-         * marker so each can still be verified key-by-key.
+-         */
++      case KBD_KEY(0, 4):   /* UP: 往旧内容翻一行 */
++        stmp3770_lcdcon_scroll_view(-1);
++        break;
+ 
+-        up_putc('<');
+-        up_putc('a' + (keycode & 3));
+-        up_putc('>');
+-#endif
++      case KBD_KEY(3, 4):   /* DOWN: 往新内容翻一行 */
++        stmp3770_lcdcon_scroll_view(1);
++        break;
++
++      case KBD_KEY(2, 4):   /* LEFT: 往前翻一页 */
++        stmp3770_lcdcon_scroll_view(-(STMP3770_LCDCON_ROWS - 1));
++        break;
++
++      case KBD_KEY(1, 4):   /* RIGHT: 往后翻一页 */
++        stmp3770_lcdcon_scroll_view(STMP3770_LCDCON_ROWS - 1);
+         break;
+ 
+       default:
+@@ -269,7 +272,6 @@ static int hp39gii_kbd_thread(int argc, char **argv)
+   memset(g_stable, 0, sizeof(g_stable));
+   memset(g_count, 0, sizeof(g_count));
+ 
+-  stmp3770_lcdcon_keymark(0x4B);   /* 'K': kbd 线程已启动 */
+ 
+   for (;;)
+     {

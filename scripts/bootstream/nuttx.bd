@@ -1,0 +1,25 @@
+// BootStream for anything that has to start at address 0.
+//
+// The boot ROM executes the stream command by command: `load` copies the raw
+// binary to the given address, `jump` continues there. NuttX's .vectors must be
+// the first thing in the image, which is why the load address is 0 and not, say,
+// 0x8000.
+//
+// Used for: nuttx.bin, and the nandrestore / nanddump / probe recovery firmware.
+
+options {
+  flags = 0x0;
+  buildNumber = 0x1;
+  productVersion = "1.0.0";
+  componentVersion = "1.0.0";
+  driveTag = 0x50;
+}
+
+sources {
+  inputFile = extern(0);
+}
+
+section (0) {
+  load inputFile > 0x0000;
+  jump 0x0000;
+}

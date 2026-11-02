@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuzhi Zhu <explodingtnt@foxmail.com>
+Date: Mon, 2 Nov 2026 13:40:49 +0800
+Subject: [PATCH] hp39gii: size the NCB metadata buffer to the real OOB width
+
+nand_fix_ncb_backup() copied 19 bytes off the OOB area into a 16-byte static
+buffer, which gcc flagged as -Warray-bounds once the copy was inlined. The three
+bytes past the end landed in the neighbouring page buffer and were overwritten
+before use, so nothing failed at run time -- but it is a real overflow on the
+stack of a function that runs at every boot.
+
+Use HP39GII_NAND_META_SIZE (19) instead of the literal, for the buffer, the
+copy and the compare.
+---
+ .hp39gii-patched                               | 0
+ boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c | 7 ++++---
+ 2 files changed, 4 insertions(+), 3 deletions(-)
+ create mode 100644 .hp39gii-patched
+
+diff --git a/.hp39gii-patched b/.hp39gii-patched
+new file mode 100644
+index 00000000..e69de29b
+diff --git a/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c b/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c
+index df2e1530..948fecf4 100644
+--- a/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c
++++ b/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c
+@@ -192,6 +192,7 @@ FAR struct mtd_dev_s *stmp3770_nand_initialize(void);
+ 
+ #define HP39GII_NAND_PAGE_SIZE  2048
+ #define HP39GII_NAND_PAGES_PBLK 64
++#define HP39GII_NAND_META_SIZE  19
+ 
+ /* 打一行文本到 LCD 控制台。 */
+ 
+@@ -247,7 +248,7 @@ static int nand_fix_ncb_backup(FAR struct mtd_dev_s *mtd)
+ {
+   static uint8_t ncb[HP39GII_NAND_PAGE_SIZE] __attribute__((aligned(32)));
+   static uint8_t rb[HP39GII_NAND_PAGE_SIZE] __attribute__((aligned(32)));
+-  static uint8_t meta[16] __attribute__((aligned(32)));
++  static uint8_t meta[HP39GII_NAND_META_SIZE] __attribute__((aligned(32)));
+ 
+   if (mtd->bread(mtd, (off_t)4 * HP39GII_NAND_PAGES_PBLK, 1, rb) != 1)
+     {
+@@ -270,7 +271,7 @@ static int nand_fix_ncb_backup(FAR struct mtd_dev_s *mtd)
+     }
+ 
+   portMTDReadPage(0, NULL);
+-  memcpy(meta, portMTDGetMetaData(), 19);
++  memcpy(meta, portMTDGetMetaData(), HP39GII_NAND_META_SIZE);
+ 
+   if (mtd->erase(mtd, 4, 1) != 1)
+     {
+@@ -291,7 +292,7 @@ static int nand_fix_ncb_backup(FAR struct mtd_dev_s *mtd)
+     }
+ 
+   portMTDReadPage(4 * HP39GII_NAND_PAGES_PBLK, NULL);
+-  if (memcmp(meta, portMTDGetMetaData(), 19) != 0)
++  if (memcmp(meta, portMTDGetMetaData(), HP39GII_NAND_META_SIZE) != 0)
+     {
+       return -7;
+     }

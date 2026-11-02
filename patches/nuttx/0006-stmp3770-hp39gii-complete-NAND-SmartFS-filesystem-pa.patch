@@ -1,0 +1,154 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: edwardzhu02 <explodingtnt@foxmail.com>
+Date: Sun, 1 Nov 2026 17:02:22 +0800
+Subject: [PATCH] stmp3770/hp39gii: complete NAND -> SmartFS filesystem path
+
+The full chain now works end-to-end in EmuGII QEMU: GPMI NAND ->
+NuttX MTD -> SmartFS format/mount -> file write/read ("hello-from-nand"
+round-trips).
+
+Fixes:
+- MTD bread/bwrite must return the number of blocks, not bytes
+  (SmartFS compares against nblocks)
+- board NAND test: pagebuf sized for a full page (was 32 bytes, the GPMI
+  DMA overflowed it and corrupted the keyboard BSS globals -> the earlier
+  data abort in stmp3770_kbd_scan)
+- smart_initialize partname NULL (yields /dev/smart0)
+- format flow mirrors mksmartfs: BIOC_LLFORMAT + BIOC_ALLOCSECT +
+  BIOC_WRITESECT to mark the root directory, otherwise open(O_CREAT) EIOs
+---
+ arch/arm/src/stmp3770/stmp3770_mtd.c          |  4 +-
+ .../arm/stmp3770/hp39gii/src/hp39gii_boot.c   | 60 +++++++++++++++++--
+ 2 files changed, 57 insertions(+), 7 deletions(-)
+
+diff --git a/arch/arm/src/stmp3770/stmp3770_mtd.c b/arch/arm/src/stmp3770/stmp3770_mtd.c
+index 44fdde57..67d080dc 100644
+--- a/arch/arm/src/stmp3770/stmp3770_mtd.c
++++ b/arch/arm/src/stmp3770/stmp3770_mtd.c
+@@ -54,7 +54,7 @@ static ssize_t stmp3770_mtd_bread(FAR struct mtd_dev_s *dev, off_t startblock,
+                       buffer + i * priv->info.PageSize_B);
+     }
+ 
+-  return (ssize_t)(nblocks * priv->info.PageSize_B);
++  return (ssize_t)nblocks;
+ }
+ 
+ static ssize_t stmp3770_mtd_bwrite(FAR struct mtd_dev_s *dev,
+@@ -71,7 +71,7 @@ static ssize_t stmp3770_mtd_bwrite(FAR struct mtd_dev_s *dev,
+                        (uint8_t *)(buffer + i * priv->info.PageSize_B));
+     }
+ 
+-  return (ssize_t)(nblocks * priv->info.PageSize_B);
++  return (ssize_t)nblocks;
+ }
+ 
+ static ssize_t stmp3770_mtd_read(FAR struct mtd_dev_s *dev,
+diff --git a/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c b/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c
+index 51e49128..e93b71c7 100644
+--- a/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c
++++ b/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c
+@@ -129,8 +129,12 @@ static int hp39gii_lcd_thread(int argc, char **argv)
+ 
+ #include "mtd_up.h"
+ #include <nuttx/mtd/mtd.h>
++#include <nuttx/fs/ioctl.h>
++#include <nuttx/fs/smart.h>
+ #include <sys/mount.h>
++#include <sys/ioctl.h>
+ #include <fcntl.h>
++#include <errno.h>
+ 
+ FAR struct mtd_dev_s *stmp3770_nand_initialize(void);
+ 
+@@ -141,7 +145,7 @@ FAR struct mtd_dev_s *stmp3770_nand_initialize(void);
+ static int hp39gii_nand_thread(int argc, char **argv)
+ {
+   FAR struct mtd_dev_s *mtd;
+-  static uint8_t pagebuf[32];
++  static uint32_t pagebuf[2048 / 4];
+   char rdbuf[64];
+   int fd;
+   int ret;
+@@ -162,7 +166,7 @@ static int hp39gii_nand_thread(int argc, char **argv)
+   hp39gii_puts("[NAND] page0:");
+   for (i = 0; i < 32; i++)
+     {
+-      hp39gii_printf("%02x", pagebuf[i]);
++      hp39gii_printf("%02x", ((uint8_t *)pagebuf)[i]);
+     }
+   hp39gii_puts("\n");
+ 
+@@ -170,13 +174,59 @@ static int hp39gii_nand_thread(int argc, char **argv)
+ 
+ #ifdef CONFIG_FS_SMARTFS
+   hp39gii_puts("[FS] smart_initialize\n");
+-  ret = smart_initialize(0, mtd, "smart0");
++  ret = smart_initialize(0, mtd, NULL);
+   if (ret < 0)
+     {
+       hp39gii_printf("[FS] smart_initialize failed: %d\n", ret);
+       return ret;
+     }
+ 
++  hp39gii_puts("[FS] format (BIOC_LLFORMAT)\n");
++  fd = open("/dev/smart0", O_RDWR);
++  if (fd < 0)
++    {
++      hp39gii_printf("[FS] open smart0 failed: %d\n", fd);
++      return fd;
++    }
++
++  ret = ioctl(fd, BIOC_LLFORMAT, 0);
++  if (ret < 0)
++    {
++      hp39gii_printf("[FS] llformat failed: %d\n", ret);
++      close(fd);
++      return ret;
++    }
++
++  /* mksmartfs 在格式化后还要分配并标记根目录扇区，缺了这步 mount 后
++   * open(O_CREAT) 会 EIO。 */
++
++  {
++    uint8_t type = SMARTFS_SECTOR_TYPE_DIR;
++    struct smart_read_write_s req;
++
++    ret = ioctl(fd, BIOC_ALLOCSECT, SMARTFS_ROOT_DIR_SECTOR);
++    if (ret != SMARTFS_ROOT_DIR_SECTOR)
++      {
++        hp39gii_printf("[FS] allocsect failed: %d\n", ret);
++        close(fd);
++        return -EIO;
++      }
++
++    req.logsector = SMARTFS_ROOT_DIR_SECTOR;
++    req.offset = 0;
++    req.count = 1;
++    req.buffer = &type;
++    ret = ioctl(fd, BIOC_WRITESECT, (unsigned long)&req);
++    if (ret != OK)
++      {
++        hp39gii_printf("[FS] writesect failed: %d\n", ret);
++        close(fd);
++        return ret;
++      }
++  }
++
++  close(fd);
++
+   hp39gii_puts("[FS] mount /data\n");
+   ret = mount("/dev/smart0", "/data", "smartfs", 0, NULL);
+   if (ret < 0)
+@@ -185,10 +235,10 @@ static int hp39gii_nand_thread(int argc, char **argv)
+       return ret;
+     }
+ 
+-  fd = open("/data/hello.txt", O_WRONLY | O_CREAT | O_TRUNC, 0666);
++  fd = open("/data/hello.txt", O_RDWR | O_CREAT, 0666);
+   if (fd < 0)
+     {
+-      hp39gii_printf("[FS] open(w) failed: %d\n", fd);
++      hp39gii_printf("[FS] open(w) failed: %d errno %d\n", fd, errno);
+       return fd;
+     }
+ 

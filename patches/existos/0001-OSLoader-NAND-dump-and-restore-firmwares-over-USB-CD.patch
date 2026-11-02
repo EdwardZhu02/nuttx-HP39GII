@@ -1,0 +1,684 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: edwardzhu02 <explodingtnt@foxmail.com>
+Date: Sun, 1 Nov 2026 23:06:25 +0800
+Subject: [PATCH] OSLoader: NAND dump and restore firmwares over USB CDC
+
+Two RAM-loaded variants that run on the 39gII without touching the
+installed system:
+
+- DUMP_ONLY (nandump.c): stream every page (data + 19 B metadata) to the
+  host.
+- RESTORE_ONLY (nandrestore.c, new): write pages back, erase blocks, read
+  pages and verify pages against host-supplied data.
+
+Both use TinyUSB CDC.  The CDC RX buffer was only 512 B at high speed,
+which silently dropped bytes in 2 KB frames, so raise RX to 4 KB and TX
+to 2 KB.
+
+Lessons baked into the restore path:
+- host must pace frames (256 B every 3 ms); faster bursts overflow.
+- the buffer handed to the GPMI write DMA must be 32-byte aligned and
+  separate from the CDC receive buffer, otherwise non-uniform pages
+  silently fail to program while uniform fills appear to work.
+- the task re-arms per connection (banner + RX flush) instead of serving
+  one session and parking.
+
+Verified on hardware: full dump 65536/65536 pages with 0 bad frames;
+full restore 10377 pages written, 55159 blank pages skipped, 0
+failures; a subsequent full dump is byte-identical in both data and OOB.
+---
+ OSLoader/CMakeLists.txt       |  23 +++
+ OSLoader/Config/tusb_config.h |   4 +-
+ OSLoader/msc_disk.c           |  12 ++
+ OSLoader/nandrestore.c        | 325 ++++++++++++++++++++++++++++++++++
+ OSLoader/nandump.c            | 157 ++++++++++++++++
+ OSLoader/start.c              |  50 ++++++
+ 6 files changed, 569 insertions(+), 2 deletions(-)
+ create mode 100644 OSLoader/nandrestore.c
+ create mode 100644 OSLoader/nandump.c
+
+diff --git a/OSLoader/CMakeLists.txt b/OSLoader/CMakeLists.txt
+index 4933370..e46a411 100644
+--- a/OSLoader/CMakeLists.txt
++++ b/OSLoader/CMakeLists.txt
+@@ -2,6 +2,29 @@ cmake_minimum_required(VERSION 3.16)
+ 
+ project(ExistOS-OSLoader VERSION 0.1.0.1)
+ 
++# PROBE_ONLY_VARIANT
++# DUMP_ONLY_VARIANT
++if(DEFINED ENV{DUMP_ONLY})
++  add_definitions(-DDUMP_ONLY)
++  message(STATUS "DUMP_ONLY build variant enabled")
++  # DUMP_PAGES env
++  if(DEFINED ENV{DUMP_PAGES})
++    add_definitions(-DDUMP_PAGES=$ENV{DUMP_PAGES})
++    message(STATUS "DUMP_PAGES=$ENV{DUMP_PAGES}")
++  endif()
++endif()
++
++if(DEFINED ENV{RESTORE_ONLY})
++  add_definitions(-DRESTORE_ONLY)
++  message(STATUS "RESTORE_ONLY build variant enabled")
++endif()
++
++if(DEFINED ENV{PROBE_ONLY})
++  add_definitions(-DPROBE_ONLY)
++  message(STATUS "PROBE_ONLY build variant enabled")
++endif()
++
++
+ 
+ add_link_options(-T ${CMAKE_SOURCE_DIR}/Script/ldr_ld.script -Wl,--gc-sections)
+ 
+diff --git a/OSLoader/Config/tusb_config.h b/OSLoader/Config/tusb_config.h
+index cd6a68d..e4f72e1 100644
+--- a/OSLoader/Config/tusb_config.h
++++ b/OSLoader/Config/tusb_config.h
+@@ -106,8 +106,8 @@
+ #define CFG_TUD_ECM_RNDIS        0
+ 
+ // CDC FIFO size of TX and RX
+-#define CFG_TUD_CDC_RX_BUFSIZE   (TUD_OPT_HIGH_SPEED ? 512 : 64)
+-#define CFG_TUD_CDC_TX_BUFSIZE   (TUD_OPT_HIGH_SPEED ? 512 : 64)
++#define CFG_TUD_CDC_RX_BUFSIZE   (TUD_OPT_HIGH_SPEED ? 4096 : 512)
++#define CFG_TUD_CDC_TX_BUFSIZE   (TUD_OPT_HIGH_SPEED ? 2048 : 512)
+ 
+ // MSC Buffer size of Device Mass storage
+ #define CFG_TUD_MSC_EP_BUFSIZE   2048
+diff --git a/OSLoader/msc_disk.c b/OSLoader/msc_disk.c
+index f8b0bd7..6b1ac7b 100644
+--- a/OSLoader/msc_disk.c
++++ b/OSLoader/msc_disk.c
+@@ -1,3 +1,4 @@
++/* DUMP_ONLY_VARIANT */
+ /*
+  * The MIT License (MIT)
+  *
+@@ -188,6 +189,11 @@ void tud_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8], uint8_t product_id[16
+ extern uint32_t CurMount;
+ 
+ bool tud_msc_test_unit_ready_cb(uint8_t lun) {
++#ifdef DUMP_ONLY
++    /* 转储模式不暴露 LUN，避免主机发 READ10 走进 FTL */
++    (void)lun;
++    return false;
++#endif
+     (void)lun;
+ 
+     return true;
+@@ -201,6 +207,12 @@ bool tud_msc_test_unit_ready_cb(uint8_t lun) {
+ extern uint32_t g_MSC_Configuration;
+ 
+ void tud_msc_capacity_cb(uint8_t lun, uint32_t *block_count, uint16_t *block_size) {
++#ifdef DUMP_ONLY
++    (void)lun;
++    *block_count = 0;
++    *block_size = 512;
++    return;
++#endif
+     (void)lun;
+     /*
+         mtdInfo_t *info = MTD_getDeviceInfo();
+diff --git a/OSLoader/nandrestore.c b/OSLoader/nandrestore.c
+new file mode 100644
+index 0000000..e17d094
+--- /dev/null
++++ b/OSLoader/nandrestore.c
+@@ -0,0 +1,325 @@
++/*
++ * HP 39gII (STMP3770) NAND 恢复固件
++ *
++ * 由 SDP 载入 SRAM 执行（和 nandump.c 同一套 OSLoader 外壳）。通过 USB CDC
++ * 从主机按页接收 data + OOB 原样写回 NAND，用于把 nanddump 的备份刷回去。
++ *
++ * 帧格式（小端，和 nandump 的 PND1 对齐）：
++ *   magic(4) | page(4) | datalen(4) | metalen(4) | data | meta | crc32(4)
++ *   crc32 覆盖 page..meta 全部字节。
++ *
++ *   PNR1  写入一页（必要时先擦所在块，写完立刻读回比对）
++ *   PNR2  只读校验一页
++ *   PNR3  ping
++ *   PNR4  擦除一个块（page 字段当块号）
++ *   PNR0  结束本次会话（主机断开后固件回到等待连接状态）
++ *
++ * 每一帧回一行 ASCII：W ok <page> / V ok <page> / W bad <page> / B ok <blk> / E ...
++ */
++#ifdef RESTORE_ONLY
++
++#include <stdio.h>
++#include <string.h>
++#include <stdint.h>
++
++#include "FreeRTOS.h"
++#include "task.h"
++
++#include "board_up.h"
++#include "display_up.h"
++#include "mtd_up.h"
++
++#include "tusb.h"
++
++#define MAX_DATA 4096
++#define MAX_META 256
++
++static uint8_t g_rx[MAX_DATA];
++static uint8_t g_rb[MAX_DATA];
++static uint8_t g_meta[MAX_META];
++static uint8_t g_meta_rb[MAX_META];
++
++/* 写 NAND 用的独立缓冲：32 字节对齐，且在编程前把收到的页拷进来，
++ * 这样 DMA 源指针不会和 CDC 接收缓冲/其它数据混在一起。 */
++static uint8_t g_wdata[MAX_DATA] __attribute__((aligned(32)));
++
++static uint32_t crc32_update(uint32_t crc, const uint8_t *p, uint32_t n)
++{
++    for (uint32_t i = 0; i < n; i++) {
++        crc ^= p[i];
++        for (int k = 0; k < 8; k++)
++            crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
++    }
++    return crc;
++}
++
++static uint32_t get32(const uint8_t *p)
++{
++    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
++           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++static void put32(uint8_t *p, uint32_t v)
++{
++    p[0] = (uint8_t)(v & 0xff);
++    p[1] = (uint8_t)((v >> 8) & 0xff);
++    p[2] = (uint8_t)((v >> 16) & 0xff);
++    p[3] = (uint8_t)((v >> 24) & 0xff);
++}
++
++static void cdc_send(const uint8_t *buf, uint32_t len)
++{
++    uint32_t off = 0;
++
++    while (off < len) {
++        if (!tud_cdc_connected())
++            return;
++        uint32_t avail = tud_cdc_write_available();
++        if (avail == 0) {
++            tud_cdc_write_flush();
++            vTaskDelay(pdMS_TO_TICKS(2));
++            continue;
++        }
++        uint32_t n = len - off;
++        if (n > avail)
++            n = avail;
++        uint32_t w = tud_cdc_write(buf + off, n);
++        tud_cdc_write_flush();
++        off += w;
++        if (w == 0)
++            vTaskDelay(pdMS_TO_TICKS(2));
++    }
++}
++
++static void say(const char *s)
++{
++    cdc_send((const uint8_t *)s, (uint32_t)strlen(s));
++}
++
++/* 读满 n 字节；返回实际读到的字节数（连接断开时提前返回） */
++static uint32_t cdc_recv(uint8_t *buf, uint32_t n)
++{
++    uint32_t off = 0;
++
++    while (off < n) {
++        if (!tud_cdc_connected())
++            return off;
++        uint32_t avail = tud_cdc_available();
++        if (avail == 0) {
++            vTaskDelay(pdMS_TO_TICKS(2));
++            continue;
++        }
++        uint32_t k = n - off;
++        if (k > avail)
++            k = avail;
++        off += tud_cdc_read(buf + off, k);
++    }
++    return off;
++}
++
++void vRestoreTask(void *pvParameters)
++{
++    mtdInfo_t info;
++    char line[64];
++    char banner[160];
++    uint32_t last_erase;
++
++    (void)pvParameters;
++
++    vTaskDelay(pdMS_TO_TICKS(1500));
++    tud_connect();
++
++    memset(&info, 0, sizeof(info));
++    portMTDDeviceInit(&info);
++
++    for (;;) {
++        /* 等主机打开 CDC */
++        while (!tud_cdc_connected())
++            vTaskDelay(pdMS_TO_TICKS(100));
++        vTaskDelay(pdMS_TO_TICKS(500));
++
++        last_erase = 0xFFFFFFFFu;
++
++        int n = snprintf(banner, sizeof(banner),
++                         "NANDRESTORE v1 pagesize=%lu meta=%lu pagesperblock=%lu blocks=%lu\n",
++                         (unsigned long)info.PageSize_B,
++                         (unsigned long)info.MetaSize_B,
++                         (unsigned long)info.PagesPerBlock,
++                         (unsigned long)info.Blocks);
++        cdc_send((const uint8_t *)banner, (uint32_t)n);
++
++        /* 上一个会话可能留下没读完的字节，先清掉，否则第一帧会错位 */
++        {
++            uint8_t junk[64];
++            while (tud_cdc_available())
++                tud_cdc_read(junk, sizeof(junk));
++        }
++
++        for (;;) {
++            uint8_t hdr[16];
++
++            if (cdc_recv(hdr, 16) != 16)
++                break;
++
++            if (memcmp(hdr, "PNR0", 4) == 0)
++                break;
++
++            int is_write = (memcmp(hdr, "PNR1", 4) == 0);
++            int is_verify = (memcmp(hdr, "PNR2", 4) == 0);
++            int is_ping = (memcmp(hdr, "PNR3", 4) == 0);
++            int is_erase = (memcmp(hdr, "PNR4", 4) == 0);
++            int is_read = (memcmp(hdr, "PNR5", 4) == 0);
++
++            if (!is_write && !is_verify && !is_ping && !is_erase && !is_read) {
++                say("E fmt\n");
++                continue;
++            }
++
++            uint32_t page = get32(hdr + 4);
++            uint32_t dlen = get32(hdr + 8);
++            uint32_t mlen = get32(hdr + 12);
++
++            if (dlen > MAX_DATA || mlen > MAX_META) {
++                say("E size\n");
++                continue;
++            }
++
++            if (cdc_recv(g_rx, dlen) != dlen)
++                break;
++            if (cdc_recv(g_meta, mlen) != mlen)
++                break;
++
++            uint8_t crcb[4];
++            if (cdc_recv(crcb, 4) != 4)
++                break;
++            uint32_t crc_got = get32(crcb);
++
++            uint8_t hb[12];
++            put32(hb + 0, page);
++            put32(hb + 4, dlen);
++            put32(hb + 8, mlen);
++            uint32_t crc = crc32_update(0xFFFFFFFFu, hb, 12);
++            crc = crc32_update(crc, g_rx, dlen);
++            crc = crc32_update(crc, g_meta, mlen);
++            crc = ~crc;
++
++            if (crc != crc_got) {
++                n = snprintf(line, sizeof(line), "E crc %lu\n",
++                             (unsigned long)page);
++                cdc_send((const uint8_t *)line, (uint32_t)n);
++                continue;
++            }
++
++            if (is_ping) {
++                say("P ok\n");
++                continue;
++            }
++
++            if (is_read) {
++                /* 读一页回给主机：PND1 | page | dlen | mlen | data | meta | crc */
++                uint32_t ps = info.PageSize_B ? info.PageSize_B : 2048u;
++                uint32_t ms = info.MetaSize_B;
++
++                if (ps > MAX_DATA || ms > MAX_META) {
++                    say("E size\n");
++                    continue;
++                }
++
++                portMTDReadPage(page, g_rb);
++                portMTDReadPage(page, NULL);
++                memcpy(g_meta_rb, portMTDGetMetaData(), ms);
++
++                uint8_t *fr = g_rx;
++                memcpy(fr, "PND1", 4);
++                put32(fr + 4, page);
++                put32(fr + 8, ps);
++                put32(fr + 12, ms);
++                memcpy(fr + 16, g_rb, ps);
++                memcpy(fr + 16 + ps, g_meta_rb, ms);
++                put32(fr + 16 + ps + ms, ~crc32_update(0xFFFFFFFFu,
++                       (const uint8_t *)&fr[4], 12 + ps + ms));
++                cdc_send(fr, 16 + ps + ms + 4);
++                continue;
++            }
++
++            if (is_erase) {
++                /* page 字段当块号用 */
++                portMTDEraseBlock(page);
++                last_erase = page;
++                n = snprintf(line, sizeof(line), "B ok %lu\n",
++                             (unsigned long)page);
++                cdc_send((const uint8_t *)line, (uint32_t)n);
++                continue;
++            }
++
++            uint32_t ps = info.PageSize_B ? info.PageSize_B : 2048u;
++            if (dlen != ps) {
++                n = snprintf(line, sizeof(line), "E dlen %lu\n",
++                             (unsigned long)dlen);
++                cdc_send((const uint8_t *)line, (uint32_t)n);
++                continue;
++            }
++
++            if (is_write) {
++                uint32_t blk = page / (info.PagesPerBlock ? info.PagesPerBlock : 64u);
++
++                /* 每块只擦一次；主机按页号升序发送。 */
++                if (blk != last_erase) {
++                    portMTDEraseBlock(blk);
++                    last_erase = blk;
++                }
++
++                memcpy(g_wdata, g_rx, ps);
++                portMTDWritePageMeta(page, g_wdata, mlen ? g_meta : NULL);
++
++                portDelayus(500);
++                portMTDReadPage(page, g_rb);
++                portMTDReadPage(page, NULL);
++                if (mlen)
++                    memcpy(g_meta_rb, portMTDGetMetaData(), mlen);
++
++                int data_ok = (memcmp(g_rb, g_rx, ps) == 0);
++                int meta_ok = !mlen || (memcmp(g_meta_rb, g_meta, mlen) == 0);
++
++                if (data_ok && meta_ok) {
++                    n = snprintf(line, sizeof(line), "W ok %lu\n",
++                                 (unsigned long)page);
++                } else if (data_ok) {
++                    n = snprintf(line, sizeof(line), "W meta %lu\n",
++                                 (unsigned long)page);
++                } else {
++                    n = snprintf(line, sizeof(line),
++                                 "W bad %lu src=%02x%02x%02x%02x "
++                                 "rb=%02x%02x%02x%02x\n",
++                                 (unsigned long)page,
++                                 g_wdata[0], g_wdata[1], g_wdata[2],
++                                 g_wdata[3],
++                                 g_rb[0], g_rb[1], g_rb[2], g_rb[3]);
++                }
++                cdc_send((const uint8_t *)line, (uint32_t)n);
++            } else {
++                portMTDReadPage(page, g_rb);
++                portMTDReadPage(page, NULL);
++                if (mlen)
++                    memcpy(g_meta_rb, portMTDGetMetaData(), mlen);
++
++                int data_ok = (memcmp(g_rb, g_rx, ps) == 0);
++                int meta_ok = !mlen || (memcmp(g_meta_rb, g_meta, mlen) == 0);
++
++                if (data_ok && meta_ok) {
++                    n = snprintf(line, sizeof(line), "V ok %lu\n",
++                                 (unsigned long)page);
++                } else {
++                    n = snprintf(line, sizeof(line), "V bad %lu\n",
++                                 (unsigned long)page);
++                }
++                cdc_send((const uint8_t *)line, (uint32_t)n);
++            }
++        }
++
++        say("RESTORE DONE\n");
++        vTaskDelay(pdMS_TO_TICKS(200));
++    }
++}
++
++#endif /* RESTORE_ONLY */
+diff --git a/OSLoader/nandump.c b/OSLoader/nandump.c
+new file mode 100644
+index 0000000..4606ed4
+--- /dev/null
++++ b/OSLoader/nandump.c
+@@ -0,0 +1,157 @@
++/*
++ * HP 39gII (STMP3770) NAND 原始转储固件 —— 只读，绝不写 flash
++ *
++ * 由 SDP (066f:3770 HID) 载入 SRAM 执行。通过 USB CDC 把 NAND 的每一页
++ * （data + OOB）原样流给主机，供离线保存成完整的 un-brick 镜像。
++ *
++ * 设计要点：
++ *  - 不启动 FTL 服务（避免 dhara 在陌生 flash 布局上格式化/写盘）
++ *  - 只调 boardInit + portMTDDeviceInit + portMTDReadPage，全部是只读路径
++ *  - MSC 回调在 DUMP_ONLY 下被打桩成"无介质"，防止 macOS 探测 LUN 时走进 FTL
++ *
++ * 帧格式（小端）：
++ *   magic "PND1"(4) | page(4) | datalen(4) | metalen(4) | data | meta | crc32(4)
++ *   crc32 覆盖 page..meta 全部字节
++ */
++#ifdef DUMP_ONLY
++
++#include <stdio.h>
++#include <string.h>
++#include <stdint.h>
++
++#include "FreeRTOS.h"
++#include "task.h"
++
++#include "board_up.h"
++#include "display_up.h"
++#include "mtd_up.h"
++
++#include "tusb.h"
++
++/* 转储范围。默认只转前 8 MB（覆盖 boot 链 + OSLoader + System + 配置）；
++ * 全盘 128 MB 用 -DDUMP_PAGES=65536 覆盖。 */
++#ifndef DUMP_START_PAGE
++#define DUMP_START_PAGE 0
++#endif
++#ifndef DUMP_PAGES
++#define DUMP_PAGES      4096
++#endif
++
++static uint8_t g_pagebuf[4096];
++static uint8_t g_meta[256];
++static uint8_t g_frame[16 + 4096 + 256 + 4];
++
++static uint32_t crc32_calc(const uint8_t *p, uint32_t n)
++{
++    uint32_t crc = 0xFFFFFFFFu;
++
++    for (uint32_t i = 0; i < n; i++) {
++        crc ^= p[i];
++        for (int k = 0; k < 8; k++)
++            crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
++    }
++    return ~crc;
++}
++
++static void put32(uint8_t *p, uint32_t v)
++{
++    p[0] = (uint8_t)(v & 0xff);
++    p[1] = (uint8_t)((v >> 8) & 0xff);
++    p[2] = (uint8_t)((v >> 16) & 0xff);
++    p[3] = (uint8_t)((v >> 24) & 0xff);
++}
++
++/* 把 buf 全部写进 CDC，必要时等主机取走 */
++static void cdc_send(const uint8_t *buf, uint32_t len)
++{
++    uint32_t off = 0;
++
++    while (off < len) {
++        if (!tud_cdc_connected())
++            return;
++        uint32_t avail = tud_cdc_write_available();
++        if (avail == 0) {
++            tud_cdc_write_flush();
++            vTaskDelay(pdMS_TO_TICKS(2));
++            continue;
++        }
++        uint32_t n = len - off;
++        if (n > avail)
++            n = avail;
++        uint32_t w = tud_cdc_write(buf + off, n);
++        tud_cdc_write_flush();
++        off += w;
++        if (w == 0)
++            vTaskDelay(pdMS_TO_TICKS(2));
++    }
++}
++
++void vDumpTask(void *pvParameters)
++{
++    mtdInfo_t info;
++    char banner[128];
++
++    (void)pvParameters;
++
++    vTaskDelay(pdMS_TO_TICKS(1500));
++
++    /* TinyUSB 起来后主动挂上 D+ */
++    tud_connect();
++
++    /* 等主机打开 CDC */
++    while (!tud_cdc_connected())
++        vTaskDelay(pdMS_TO_TICKS(100));
++    vTaskDelay(pdMS_TO_TICKS(500));
++
++    memset(&info, 0, sizeof(info));
++    portMTDDeviceInit(&info);
++
++    int n = snprintf(banner, sizeof(banner),
++                     "NANDUMP v1 pagesize=%lu meta=%lu pagesperblock=%lu blocks=%lu\n",
++                     (unsigned long)info.PageSize_B,
++                     (unsigned long)info.MetaSize_B,
++                     (unsigned long)info.PagesPerBlock,
++                     (unsigned long)info.Blocks);
++    cdc_send((const uint8_t *)banner, (uint32_t)n);
++
++    uint32_t ps = info.PageSize_B ? info.PageSize_B : 2048;
++    uint32_t ms = info.MetaSize_B ? info.MetaSize_B : 64;
++    if (ps > sizeof(g_pagebuf) || ms > sizeof(g_meta)) {
++        const char *e = "ERROR geometry too large\n";
++        cdc_send((const uint8_t *)e, (uint32_t)strlen(e));
++        for (;;)
++            vTaskDelay(pdMS_TO_TICKS(1000));
++    }
++
++    for (uint32_t i = 0; i < DUMP_PAGES; i++) {
++        uint32_t page = DUMP_START_PAGE + i;
++
++        portMTDReadPage(page, g_pagebuf);        /* 页数据 */
++        portMTDReadPage(page, NULL);             /* 只读 OOB，填 aux 缓冲 */
++        memcpy(g_meta, portMTDGetMetaData(), ms);
++
++        g_frame[0] = 'P';
++        g_frame[1] = 'N';
++        g_frame[2] = 'D';
++        g_frame[3] = '1';
++        put32(g_frame + 4, page);
++        put32(g_frame + 8, ps);
++        put32(g_frame + 12, ms);
++        memcpy(g_frame + 16, g_pagebuf, ps);
++        memcpy(g_frame + 16 + ps, g_meta, ms);
++        put32(g_frame + 16 + ps + ms, crc32_calc(g_frame + 4, 12 + ps + ms));
++
++        cdc_send(g_frame, 16 + ps + ms + 4);
++
++        if (!tud_cdc_connected())
++            break;
++    }
++
++    const char *done = "NANDUMP END\n";
++    cdc_send((const uint8_t *)done, (uint32_t)strlen(done));
++
++    for (;;)
++        vTaskDelay(pdMS_TO_TICKS(1000));
++}
++
++#endif /* DUMP_ONLY */
+diff --git a/OSLoader/start.c b/OSLoader/start.c
+index 454d3e7..dc78fcd 100644
+--- a/OSLoader/start.c
++++ b/OSLoader/start.c
+@@ -997,6 +997,21 @@ void vApplicationIdleHook(void) {
+ }
+ 
+ extern int bootTimes;
++/* PROBE_ONLY_VARIANT */
++#ifdef PROBE_ONLY
++extern void vProbeTask(void *pvParameters);
++#endif
++
++/* DUMP_ONLY_VARIANT */
++#ifdef DUMP_ONLY
++extern void vDumpTask(void *pvParameters);
++#endif
++
++/* RESTORE_ONLY_VARIANT */
++#ifdef RESTORE_ONLY
++extern void vRestoreTask(void *pvParameters);
++#endif
++
+ volatile void _startup() {
+ 
+     printf("OSLoader starting...\nreboot count: %d\n", bootTimes);
+@@ -1006,6 +1021,41 @@ volatile void _startup() {
+     boardInit();
+     printf("booting .....\n");
+ 
++#ifdef DUMP_ONLY
++    /* 转储模式：只起 TinyUSB + 转储任务，不启动 MTD/FTL/System，纯只读 */
++    xTaskCreate(vTaskTinyUSB, "TinyUSB", configMINIMAL_STACK_SIZE, NULL,
++                configMAX_PRIORITIES - 4, NULL);
++    xTaskCreate(vDumpTask, "NandDump", configMINIMAL_STACK_SIZE * 2, NULL,
++                configMAX_PRIORITIES - 2, NULL);
++    vTaskStartScheduler();
++    for (;;)
++        ;
++#endif
++
++#ifdef RESTORE_ONLY
++    /* 恢复模式：只起 TinyUSB + 恢复任务，不启动 MTD/FTL/System */
++    xTaskCreate(vTaskTinyUSB, "TinyUSB", configMINIMAL_STACK_SIZE, NULL,
++                configMAX_PRIORITIES - 4, NULL);
++    xTaskCreate(vRestoreTask, "NandRestore", configMINIMAL_STACK_SIZE * 3, NULL,
++                configMAX_PRIORITIES - 2, NULL);
++    vTaskStartScheduler();
++    for (;;)
++        ;
++#endif
++
++
++#ifdef PROBE_ONLY
++    /* 探测模式：只起显示服务 + 探测任务，不碰 NAND / FTL / USB */
++    xTaskCreate(vDispSvc, "Display Svc", configMINIMAL_STACK_SIZE, NULL,
++                configMAX_PRIORITIES - 1, &pDispTask);
++    xTaskCreate(vProbeTask, "Probe", configMINIMAL_STACK_SIZE * 4, NULL,
++                configMAX_PRIORITIES - 2, NULL);
++    vTaskStartScheduler();
++    for (;;)
++        ;
++#endif
++
++
+     xTaskCreate(vTask1, "Status Print", configMINIMAL_STACK_SIZE, NULL, configMAX_PRIORITIES - 1, &pStatusPrintTask);
+     xTaskCreate(vMTDSvc, "MTD Svc", configMINIMAL_STACK_SIZE, NULL, configMAX_PRIORITIES - 2, NULL);
+     xTaskCreate(vFTLSvc, "FTL Svc", configMINIMAL_STACK_SIZE, NULL, configMAX_PRIORITIES - 3, NULL);

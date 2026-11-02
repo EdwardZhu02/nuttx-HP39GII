@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: edwardzhu02 <explodingtnt@foxmail.com>
+Date: Sun, 1 Nov 2026 22:29:35 +0800
+Subject: [PATCH] stmp3770: pin the NAND geometry, NAND reads verified on
+ hardware
+
+With the GPMI on HF the byte offset disappeared: the ID reads as
+ad f1 00 1d ad f1 and pages 0 and 1984 match the 128 MB backup exactly
+(p0 starts 53 54 4d 50, p1984 starts 22 e1 00 28).
+
+The ID-derived geometry was wrong on hardware (it computed a 1024-byte
+page from ID byte 3 = 0x1d, while the data is clearly 2 KB pages), so
+pin the real geometry: 2048 B pages, 64 pages of 128 KB blocks, 1024
+blocks, 19 B metadata.
+
+The board test now prints a clear STMP magic check and drops the
+clock/ECC register dump used during bring-up.
+---
+ arch/arm/src/stmp3770/stmp3770_gpmi.c         | 20 ++++++++++---------
+ .../arm/stmp3770/hp39gii/src/hp39gii_boot.c   | 19 +++---------------
+ 2 files changed, 14 insertions(+), 25 deletions(-)
+
+diff --git a/arch/arm/src/stmp3770/stmp3770_gpmi.c b/arch/arm/src/stmp3770/stmp3770_gpmi.c
+index 122d9c0a..d46944cd 100644
+--- a/arch/arm/src/stmp3770/stmp3770_gpmi.c
++++ b/arch/arm/src/stmp3770/stmp3770_gpmi.c
+@@ -1377,15 +1377,17 @@ static void GPMI_GetNANDInfo(mtdInfo_t *mtdinfo)
+     }
+     INFO("\n");
+ 
+-    char DIDesc4Rd = ((uint8_t *)FlashRecCommandBuffer)[3];
+-
+-    mtdinfo->PageSize_B = (1 << ( DIDesc4Rd & 0x3 )) * 1024 ;
+-    mtdinfo->SpareSizePerPage_B = mtdinfo->PageSize_B / 512 * ((1 << ((DIDesc4Rd >> 2) & 1)) * 8);
+-    mtdinfo->BlockSize_KB = (1 << ((DIDesc4Rd >> 4) & 0x3)) * 64;
+-    mtdinfo->PagesPerBlock = mtdinfo->BlockSize_KB * 1024 / mtdinfo->PageSize_B;
+-
+-    mtdinfo->MetaSize_B = 19;
+-    mtdinfo->Blocks = 1024;
++    /* 这颗板子固定是 128 MB SLC，几何按实测写死：页 2048 B、每页 64 B 备用区
++     * （用 19 B 元数据）、块 128 KB、共 1024 块。原来按 ID 的 ONFI 描述字节
++     * 推算，真机上 ID 字节 3 = 0x1d 会算出 1024 B 页，和实际读到 2K 页的数据
++     * 矛盾；读回内容与 128 MB 备份逐字节一致，说明就是 2K 页。 */
++
++    mtdinfo->PageSize_B        = 2048;
++    mtdinfo->SpareSizePerPage_B = 64;
++    mtdinfo->BlockSize_KB      = 128;
++    mtdinfo->PagesPerBlock     = 64;
++    mtdinfo->MetaSize_B        = 19;
++    mtdinfo->Blocks            = 1024;
+ 
+     INFO("PageSize:%lu B\n", mtdinfo->PageSize_B);
+     INFO("SpareSizePerPage:%lu B\n", mtdinfo->SpareSizePerPage_B);
+diff --git a/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c b/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c
+index ad3ef588..3ddef285 100644
+--- a/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c
++++ b/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c
+@@ -280,13 +280,6 @@ static int hp39gii_nand_thread(int argc, char **argv)
+ 
+   sleep(3);
+ 
+-  stmp3770_nand_stats(st);
+-  nand_hex32("pll   ", st[10]);
+-  nand_hex32("cpu   ", st[11]);
+-  nand_hex32("clkseq", st[8]);
+-  nand_hex32("gpmicl", st[9]);
+-  nand_hex32("frac  ", st[12]);
+-
+   stmp3770_lcdcon_puts("NAND init...\r\n");
+ 
+   mtd = stmp3770_nand_initialize();
+@@ -318,15 +311,9 @@ static int hp39gii_nand_thread(int argc, char **argv)
+   mtd->bread(mtd, 0, 1, pagebuf);
+   nand_hex_line("p0    ", pagebuf, 16);
+ 
+-  stmp3770_nand_stats(st);
+-  nand_hex32("fin   ", st[0]);
+-  nand_hex32("sema  ", st[1]);
+-  nand_hex32("ahb   ", st[2]);
+-  nand_hex32("apb   ", st[3]);
+-  nand_hex32("ecc8c ", st[4]);
+-  nand_hex32("ecc8s ", st[5]);
+-  nand_hex32("apbh0 ", st[6]);
+-  nand_hex32("eccres", st[7]);
++  stmp3770_lcdcon_puts(pagebuf[0] == 0x53 && pagebuf[1] == 0x54 &&
++                       pagebuf[2] == 0x4d && pagebuf[3] == 0x50 ?
++                       "STMP magic OK\r\n" : "STMP magic BAD\r\n");
+ 
+   stmp3770_lcdcon_puts("read p1\r\n");
+   mtd->bread(mtd, 1, 1, pagebuf);

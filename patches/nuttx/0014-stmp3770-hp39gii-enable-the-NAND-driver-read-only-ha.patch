@@ -1,0 +1,211 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: edwardzhu02 <explodingtnt@foxmail.com>
+Date: Sun, 1 Nov 2026 22:04:49 +0800
+Subject: [PATCH] stmp3770/hp39gii: enable the NAND driver, read-only hardware
+ smoke test
+
+- Run the GPMI clock from the 24 MHz crystal (BYPASS_GPMI) instead of
+  assuming the 480 MHz PLL.  We do not call stmp3770_clockconfig() on
+  hardware (it hangs the part), so the PLL state is unknown; the crystal
+  path is always available, just slower.
+- Replace the board NAND thread with a read-only test: init GPMI/ECC8,
+  read pages 0, 1 and 1984 and print them in hex on the LCD console.
+  The old thread formatted the NAND and wrote /data/hello.txt, which must
+  not run against the stock firmware image.
+- Enable CONFIG_STMP3770_NAND.
+
+Verified in EmuGII: init OK, three pages read back (all 0xff on the blank
+model NAND).
+---
+ arch/arm/src/stmp3770/stmp3770_gpmi.c         |  10 +-
+ .../arm/stmp3770/hp39gii/src/hp39gii_boot.c   | 131 +++++-------------
+ 2 files changed, 44 insertions(+), 97 deletions(-)
+
+diff --git a/arch/arm/src/stmp3770/stmp3770_gpmi.c b/arch/arm/src/stmp3770/stmp3770_gpmi.c
+index 34789967..57679df6 100644
+--- a/arch/arm/src/stmp3770/stmp3770_gpmi.c
++++ b/arch/arm/src/stmp3770/stmp3770_gpmi.c
+@@ -160,13 +160,15 @@ static void GPMI_ClockConfigure()
+     BF_CLR(CLKCTRL_GPMI, CLKGATE);
+     BF_CLR(CLKCTRL_FRAC, CLKGATEIO);
+ 
+-    HW_CLKCTRL_GPMI_WR(BF_CLKCTRL_GPMI_DIV(2));    // 480 / 2 MHz
++    HW_CLKCTRL_GPMI_WR(BF_CLKCTRL_GPMI_DIV(2));
+     INFO("GPMI CLK DIV:%d\n", BF_RD(CLKCTRL_GPMI, DIV));
+-    //BF_CS1(CLKCTRL_GPMI, DIV, 2);
+ 
+-    BF_CLR(CLKCTRL_CLKSEQ, BYPASS_GPMI);    //Set TO HF
++    /* 真机上没有跑 stmp3770_clockconfig()（会卡死芯片），PLL 状态未知。
++     * GPMI 直接旁路到 24 MHz 晶振，时序常数按 24 MHz 算，慢但一定能跑。 */
+ 
+-    GPMIFreq = 480000000ULL / 2ULL;
++    BF_SET(CLKCTRL_CLKSEQ, BYPASS_GPMI);
++
++    GPMIFreq = 24000000ULL;
+ 
+ 
+ }
+diff --git a/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c b/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c
+index 25ab04d3..771ec885 100644
+--- a/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c
++++ b/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c
+@@ -170,121 +170,66 @@ FAR struct mtd_dev_s *stmp3770_nand_initialize(void);
+  * 打印前 32 字节。放在低优先级线程里，避免 GPMI 的轮询等待饿死 NSH。
+  */
+ 
+-static int hp39gii_nand_thread(int argc, char **argv)
++/* 把一段字节以十六进制打到 LCD 控制台。 */
++
++static void nand_hex_line(FAR const char *tag, FAR const uint8_t *p, int n)
+ {
+-  FAR struct mtd_dev_s *mtd;
+-  static uint32_t pagebuf[2048 / 4];
+-  char rdbuf[64];
+-  int fd;
+-  int ret;
++  static const char hex[] = "0123456789abcdef";
++  char line[64];
+   int i;
++  int k = 0;
+ 
+-  sleep(5);
+-
+-  hp39gii_puts("[NAND] init\n");
+-  mtd = stmp3770_nand_initialize();
+-  if (mtd == NULL)
++  while (*tag != 0 && k < 20)
+     {
+-      hp39gii_puts("[NAND] init failed\n");
+-      return -1;
++      line[k++] = *tag++;
+     }
+ 
+-  hp39gii_puts("[NAND] read page 0 (via MTD)\n");
+-  mtd->bread(mtd, 0, 1, pagebuf);
+-  hp39gii_puts("[NAND] page0:");
+-  for (i = 0; i < 32; i++)
++  for (i = 0; i < n && k < 60; i++)
+     {
+-      hp39gii_printf("%02x", ((uint8_t *)pagebuf)[i]);
++      line[k++] = hex[p[i] >> 4];
++      line[k++] = hex[p[i] & 15];
++      line[k++] = 0x20;
+     }
+-  hp39gii_puts("\n");
+ 
+-  /* SmartFS 文件系统：把 NAND 挂到 /data，写一个文件再读回 */
++  line[k++] = 0x0d;
++  line[k++] = 0x0a;
++  line[k]   = 0;
+ 
+-#ifdef CONFIG_FS_SMARTFS
+-  hp39gii_puts("[FS] smart_initialize\n");
+-  ret = smart_initialize(0, mtd, NULL);
+-  if (ret < 0)
+-    {
+-      hp39gii_printf("[FS] smart_initialize failed: %d\n", ret);
+-      return ret;
+-    }
+-
+-  hp39gii_puts("[FS] format (BIOC_LLFORMAT)\n");
+-  fd = open("/dev/smart0", O_RDWR);
+-  if (fd < 0)
+-    {
+-      hp39gii_printf("[FS] open smart0 failed: %d\n", fd);
+-      return fd;
+-    }
+-
+-  ret = ioctl(fd, BIOC_LLFORMAT, 0);
+-  if (ret < 0)
+-    {
+-      hp39gii_printf("[FS] llformat failed: %d\n", ret);
+-      close(fd);
+-      return ret;
+-    }
+-
+-  /* mksmartfs 在格式化后还要分配并标记根目录扇区，缺了这步 mount 后
+-   * open(O_CREAT) 会 EIO。 */
++  stmp3770_lcdcon_puts(line);
++}
+ 
+-  {
+-    uint8_t type = SMARTFS_SECTOR_TYPE_DIR;
+-    struct smart_read_write_s req;
++/* 只读冒烟测试：初始化 GPMI/ECC8，读几页看内容。
++ * 绝不写 NAND —— 真机上存的是原厂固件，写坏了要整片回刷。 */
+ 
+-    ret = ioctl(fd, BIOC_ALLOCSECT, SMARTFS_ROOT_DIR_SECTOR);
+-    if (ret != SMARTFS_ROOT_DIR_SECTOR)
+-      {
+-        hp39gii_printf("[FS] allocsect failed: %d\n", ret);
+-        close(fd);
+-        return -EIO;
+-      }
++static int hp39gii_nand_thread(int argc, char **argv)
++{
++  FAR struct mtd_dev_s *mtd;
++  static uint32_t pagebuf[2048 / 4];
++  FAR uint8_t *p = (FAR uint8_t *)pagebuf;
+ 
+-    req.logsector = SMARTFS_ROOT_DIR_SECTOR;
+-    req.offset = 0;
+-    req.count = 1;
+-    req.buffer = &type;
+-    ret = ioctl(fd, BIOC_WRITESECT, (unsigned long)&req);
+-    if (ret != OK)
+-      {
+-        hp39gii_printf("[FS] writesect failed: %d\n", ret);
+-        close(fd);
+-        return ret;
+-      }
+-  }
++  sleep(3);
+ 
+-  close(fd);
++  stmp3770_lcdcon_puts("NAND init...\r\n");
+ 
+-  hp39gii_puts("[FS] mount /data\n");
+-  ret = mount("/dev/smart0", "/data", "smartfs", 0, NULL);
+-  if (ret < 0)
++  mtd = stmp3770_nand_initialize();
++  if (mtd == NULL)
+     {
+-      hp39gii_printf("[FS] mount failed: %d\n", ret);
+-      return ret;
++      stmp3770_lcdcon_puts("NAND init FAILED\r\n");
++      return -1;
+     }
+ 
+-  fd = open("/data/hello.txt", O_RDWR | O_CREAT, 0666);
+-  if (fd < 0)
+-    {
+-      hp39gii_printf("[FS] open(w) failed: %d errno %d\n", fd, errno);
+-      return fd;
+-    }
++  stmp3770_lcdcon_puts("NAND init OK\r\n");
+ 
+-  write(fd, "hello-from-nand\n", 16);
+-  close(fd);
++  mtd->bread(mtd, 0, 1, p);
++  nand_hex_line("p0    ", p, 16);
+ 
+-  memset(rdbuf, 0, sizeof(rdbuf));
+-  fd = open("/data/hello.txt", O_RDONLY);
+-  if (fd >= 0)
+-    {
+-      read(fd, rdbuf, sizeof(rdbuf) - 1);
+-      close(fd);
+-    }
++  mtd->bread(mtd, 1, 1, p);
++  nand_hex_line("p1    ", p, 16);
+ 
+-  hp39gii_printf("[FS] read back: %s\n", rdbuf);
+-#endif
++  mtd->bread(mtd, 1984, 1, p);
++  nand_hex_line("p1984 ", p, 16);
+ 
+-  hp39gii_puts("[NAND] ok\n");
++  stmp3770_lcdcon_puts("NAND read done\r\n");
+   return 0;
+ }
+ 

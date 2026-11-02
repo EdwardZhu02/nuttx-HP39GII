@@ -1,0 +1,276 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: edwardzhu02 <explodingtnt@foxmail.com>
+Date: Sun, 1 Nov 2026 22:14:20 +0800
+Subject: [PATCH] stmp3770/hp39gii: F2 types a minus, NAND bus state dump
+
+- F2 (matrix 1,1) emits "-", and the hint bar now reads
+  "F1=SPC F2=- UP/DN=SCRL L/R=PAGE".
+- Bound every APBH DEBUG2 byte-counter wait as well, so no NAND read
+  path can spin forever.
+- After the first page read, dump ECC_FIN, the channel semaphore, AHB/APB
+  byte counters, ECC8_CTRL/STATUS1, APBH_CTRL0 and the accumulated ECC
+  result, plus the clock registers before init.
+
+Hardware currently reads back all 0x00 (the page buffer is never
+written), so the ECC/DMA transfer is not completing.
+---
+ arch/arm/src/stmp3770/stmp3770_gpmi.c         | 69 ++++++++++++++-----
+ arch/arm/src/stmp3770/stmp3770_lcdcon.c       |  2 +-
+ .../arm/stmp3770/hp39gii/src/hp39gii_boot.c   | 47 +++++++++++++
+ boards/arm/stmp3770/hp39gii/src/hp39gii_kbd.c |  1 +
+ 4 files changed, 100 insertions(+), 19 deletions(-)
+
+diff --git a/arch/arm/src/stmp3770/stmp3770_gpmi.c b/arch/arm/src/stmp3770/stmp3770_gpmi.c
+index c43ffb48..4148f571 100644
+--- a/arch/arm/src/stmp3770/stmp3770_gpmi.c
++++ b/arch/arm/src/stmp3770/stmp3770_gpmi.c
+@@ -931,8 +931,10 @@ static inline void waitLastOpa()
+     switch (LastOpa)
+     {
+     case GPMI_OPA_READ:
+-        while(HW_APBH_CHn_DEBUG2(NAND_DMA_Channel).B.APB_BYTES);
+-        while(HW_APBH_CHn_DEBUG2(NAND_DMA_Channel).B.AHB_BYTES);
++        { uint32_t _s = 0; while (HW_APBH_CHn_DEBUG2(NAND_DMA_Channel).B.APB_BYTES)
++            { if (++_s > 5000000u) break; } }
++        { uint32_t _s = 0; while (HW_APBH_CHn_DEBUG2(NAND_DMA_Channel).B.AHB_BYTES)
++            { if (++_s > 5000000u) break; } }
+ /*
+         while(HW_DIGCTL_MICROSECONDS_RD() - LastReadTime < defaultTiming.tREAD_us)
+         {
+@@ -941,8 +943,10 @@ static inline void waitLastOpa()
+ 
+         break;
+     case GPMI_OPA_WRITE:
+-        while(HW_APBH_CHn_DEBUG2(NAND_DMA_Channel).B.AHB_BYTES);
+-        while(HW_APBH_CHn_DEBUG2(NAND_DMA_Channel).B.APB_BYTES);
++        { uint32_t _s = 0; while (HW_APBH_CHn_DEBUG2(NAND_DMA_Channel).B.AHB_BYTES)
++            { if (++_s > 5000000u) break; } }
++        { uint32_t _s = 0; while (HW_APBH_CHn_DEBUG2(NAND_DMA_Channel).B.APB_BYTES)
++            { if (++_s > 5000000u) break; } }
+ /*
+         while(HW_DIGCTL_MICROSECONDS_RD() - LastProgTime < defaultTiming.tPROG_us)
+         {
+@@ -953,8 +957,10 @@ static inline void waitLastOpa()
+     case GPMI_OPA_ERASE:
+ 
+ 
+-        while(HW_APBH_CHn_DEBUG2(NAND_DMA_Channel).B.AHB_BYTES);
+-        while(HW_APBH_CHn_DEBUG2(NAND_DMA_Channel).B.APB_BYTES);
++        { uint32_t _s = 0; while (HW_APBH_CHn_DEBUG2(NAND_DMA_Channel).B.AHB_BYTES)
++            { if (++_s > 5000000u) break; } }
++        { uint32_t _s = 0; while (HW_APBH_CHn_DEBUG2(NAND_DMA_Channel).B.APB_BYTES)
++            { if (++_s > 5000000u) break; } }
+         
+         while(HW_DIGCTL_MICROSECONDS_RD() - LastEraseTime < defaultTiming.tBERS_us)
+         {
+@@ -1019,7 +1025,7 @@ static inline void   GPMI_ReadPage(uint32_t ColumnAddress, uint32_t RowAddress,
+         while ((HW_APBH_CHn_SEMA(NAND_DMA_Channel).B.INCREMENT_SEMA) &&
+                !ECC_FIN)
+             {
+-                if (++spin > 20000000u)
++                if (++spin > 5000000u)
+                     break;
+             }
+     }
+@@ -1070,8 +1076,10 @@ static inline void   GPMI_ReadPage(uint32_t ColumnAddress, uint32_t RowAddress,
+     LastReadTime = HW_DIGCTL_MICROSECONDS_RD();
+     LastOpa = GPMI_OPA_READ;
+ 
+-        while(HW_APBH_CHn_DEBUG2(NAND_DMA_Channel).B.AHB_BYTES);
+-        while(HW_APBH_CHn_DEBUG2(NAND_DMA_Channel).B.APB_BYTES);
++        { uint32_t _s = 0; while (HW_APBH_CHn_DEBUG2(NAND_DMA_Channel).B.AHB_BYTES)
++            { if (++_s > 5000000u) break; } }
++        { uint32_t _s = 0; while (HW_APBH_CHn_DEBUG2(NAND_DMA_Channel).B.APB_BYTES)
++            { if (++_s > 5000000u) break; } }
+         //portDelayus(100);
+ 
+         {
+@@ -1079,7 +1087,7 @@ static inline void   GPMI_ReadPage(uint32_t ColumnAddress, uint32_t RowAddress,
+ 
+             while(probe[16] == 0x23)
+             {
+-                if (++spin > 20000000u)
++                if (++spin > 5000000u)
+                     break;
+             }
+         }
+@@ -1120,8 +1128,10 @@ static inline void    GPMI_EraseBlock(uint32_t blockAddress, bool block)
+     LastEraseTime = HW_DIGCTL_MICROSECONDS_RD();
+     LastOpa = GPMI_OPA_ERASE;
+ 
+-        while(HW_APBH_CHn_DEBUG2(NAND_DMA_Channel).B.AHB_BYTES);
+-        while(HW_APBH_CHn_DEBUG2(NAND_DMA_Channel).B.APB_BYTES);
++        { uint32_t _s = 0; while (HW_APBH_CHn_DEBUG2(NAND_DMA_Channel).B.AHB_BYTES)
++            { if (++_s > 5000000u) break; } }
++        { uint32_t _s = 0; while (HW_APBH_CHn_DEBUG2(NAND_DMA_Channel).B.APB_BYTES)
++            { if (++_s > 5000000u) break; } }
+         
+         //portDelayms(4);
+ }
+@@ -1179,8 +1189,10 @@ static inline void    GPMI_WritePage(uint32_t ColumnAddress, uint32_t RowAddress
+     LastEraseTime = HW_DIGCTL_MICROSECONDS_RD();
+     LastOpa = GPMI_OPA_WRITE;
+ 
+-        while(HW_APBH_CHn_DEBUG2(NAND_DMA_Channel).B.AHB_BYTES);
+-        while(HW_APBH_CHn_DEBUG2(NAND_DMA_Channel).B.APB_BYTES);
++        { uint32_t _s = 0; while (HW_APBH_CHn_DEBUG2(NAND_DMA_Channel).B.AHB_BYTES)
++            { if (++_s > 5000000u) break; } }
++        { uint32_t _s = 0; while (HW_APBH_CHn_DEBUG2(NAND_DMA_Channel).B.APB_BYTES)
++            { if (++_s > 5000000u) break; } }
+         
+         //portDelayus(200);
+ }
+@@ -1215,8 +1227,10 @@ static inline void    GPMI_CopyPage(uint32_t srcPage, uint32_t dstPage)
+     while ((HW_APBH_CHn_SEMA(NAND_DMA_Channel).B.INCREMENT_SEMA) && (!ECC_FIN))
+         ;
+ 
+-        while(HW_APBH_CHn_DEBUG2(NAND_DMA_Channel).B.AHB_BYTES);
+-        while(HW_APBH_CHn_DEBUG2(NAND_DMA_Channel).B.APB_BYTES);
++        { uint32_t _s = 0; while (HW_APBH_CHn_DEBUG2(NAND_DMA_Channel).B.AHB_BYTES)
++            { if (++_s > 5000000u) break; } }
++        { uint32_t _s = 0; while (HW_APBH_CHn_DEBUG2(NAND_DMA_Channel).B.APB_BYTES)
++            { if (++_s > 5000000u) break; } }
+         /*
+     portDelayus(defaultTiming.tREAD_us * 10);
+     portDelayus(defaultTiming.tREAD_us * 10);
+@@ -1247,8 +1261,10 @@ static inline void    GPMI_CopyPage(uint32_t srcPage, uint32_t dstPage)
+     LastProgTime = HW_DIGCTL_MICROSECONDS_RD();
+     LastOpa = GPMI_OPA_WRITE;
+ 
+-        while(HW_APBH_CHn_DEBUG2(NAND_DMA_Channel).B.AHB_BYTES);
+-        while(HW_APBH_CHn_DEBUG2(NAND_DMA_Channel).B.APB_BYTES);
++        { uint32_t _s = 0; while (HW_APBH_CHn_DEBUG2(NAND_DMA_Channel).B.AHB_BYTES)
++            { if (++_s > 5000000u) break; } }
++        { uint32_t _s = 0; while (HW_APBH_CHn_DEBUG2(NAND_DMA_Channel).B.APB_BYTES)
++            { if (++_s > 5000000u) break; } }
+         
+         //portDelayus(200);
+ }
+@@ -1457,6 +1473,23 @@ void portMTDDeviceInit(mtdInfo_t *mtdinfo)
+ }
+ //static uint32_t lastRDPage = 0xFFFFFFFF;
+ 
++void stmp3770_nand_stats(FAR uint32_t *out)
++{
++    out[0]  = ECC_FIN ? 1u : 0u;
++    out[1]  = (uint32_t)HW_APBH_CHn_SEMA(NAND_DMA_Channel).B.INCREMENT_SEMA;
++    out[2]  = (uint32_t)HW_APBH_CHn_DEBUG2(NAND_DMA_Channel).B.AHB_BYTES;
++    out[3]  = (uint32_t)HW_APBH_CHn_DEBUG2(NAND_DMA_Channel).B.APB_BYTES;
++    out[4]  = HW_ECC8_CTRL_RD();
++    out[5]  = HW_ECC8_STATUS1_RD();
++    out[6]  = HW_APBH_CTRL0_RD();
++    out[7]  = (uint32_t)ECCResult;
++    out[8]  = HW_CLKCTRL_CLKSEQ_RD();
++    out[9]  = HW_CLKCTRL_GPMI_RD();
++    out[10] = HW_CLKCTRL_PLLCTRL0_RD();
++    out[11] = HW_CLKCTRL_CPU_RD();
++    out[12] = HW_CLKCTRL_FRAC_RD();
++}
++
+ FAR const uint8_t *stmp3770_nand_id(void)
+ {
+     return (FAR const uint8_t *)FlashRecCommandBuffer;
+diff --git a/arch/arm/src/stmp3770/stmp3770_lcdcon.c b/arch/arm/src/stmp3770/stmp3770_lcdcon.c
+index 924ffffc..1da92cca 100644
+--- a/arch/arm/src/stmp3770/stmp3770_lcdcon.c
++++ b/arch/arm/src/stmp3770/stmp3770_lcdcon.c
+@@ -17,7 +17,7 @@
+ 
+ #define TEXT_ROWS (ROWS - 1)
+ #define HINT_ROW  (ROWS - 1)
+-#define HINT_TEXT "F1=SPC  UP/DN=SCROLL  L/R=PAGE"
++#define HINT_TEXT "F1=SPC F2=- UP/DN=SCRL L/R=PAGE"
+ 
+ 
+ /* 8x8 bitmap font, ASCII 32..126, one byte per row (bit7 = leftmost). */
+diff --git a/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c b/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c
+index 0e9b7bb1..ad3ef588 100644
+--- a/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c
++++ b/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c
+@@ -198,6 +198,34 @@ static void nand_hex_line(FAR const char *tag, FAR const uint8_t *p, int n)
+   stmp3770_lcdcon_puts(line);
+ }
+ 
++/* 打一个 32 位十六进制值（带标签）到 LCD 控制台。 */
++
++static void nand_hex32(FAR const char *tag, uint32_t v)
++{
++  static const char hex[] = "0123456789abcdef";
++  char b[40];
++  int n = 0;
++  int shift;
++
++  while (*tag != 0)
++    {
++      b[n++] = *tag++;
++    }
++
++  b[n++] = '=';
++
++  for (shift = 28; shift >= 0; shift -= 4)
++    {
++      b[n++] = hex[(v >> shift) & 15];
++    }
++
++  b[n++] = 0x0d;
++  b[n++] = 0x0a;
++  b[n]   = 0;
++
++  stmp3770_lcdcon_puts(b);
++}
++
+ /* 打一个十进制数（带标签）到 LCD 控制台。 */
+ 
+ static void nand_print_num(FAR const char *tag, uint32_t v)
+@@ -243,13 +271,22 @@ static int hp39gii_nand_thread(int argc, char **argv)
+   FAR struct mtd_dev_s *mtd;
+   struct mtd_geometry_s geo;
+   FAR const uint8_t *id;
++  uint32_t st[13];
+   extern FAR const uint8_t *stmp3770_nand_id(void);
++  extern void stmp3770_nand_stats(FAR uint32_t *out);
+   static uint8_t pagebuf[8192] __attribute__((aligned(4)));
+ 
+   memset(&geo, 0, sizeof(geo));
+ 
+   sleep(3);
+ 
++  stmp3770_nand_stats(st);
++  nand_hex32("pll   ", st[10]);
++  nand_hex32("cpu   ", st[11]);
++  nand_hex32("clkseq", st[8]);
++  nand_hex32("gpmicl", st[9]);
++  nand_hex32("frac  ", st[12]);
++
+   stmp3770_lcdcon_puts("NAND init...\r\n");
+ 
+   mtd = stmp3770_nand_initialize();
+@@ -281,6 +318,16 @@ static int hp39gii_nand_thread(int argc, char **argv)
+   mtd->bread(mtd, 0, 1, pagebuf);
+   nand_hex_line("p0    ", pagebuf, 16);
+ 
++  stmp3770_nand_stats(st);
++  nand_hex32("fin   ", st[0]);
++  nand_hex32("sema  ", st[1]);
++  nand_hex32("ahb   ", st[2]);
++  nand_hex32("apb   ", st[3]);
++  nand_hex32("ecc8c ", st[4]);
++  nand_hex32("ecc8s ", st[5]);
++  nand_hex32("apbh0 ", st[6]);
++  nand_hex32("eccres", st[7]);
++
+   stmp3770_lcdcon_puts("read p1\r\n");
+   mtd->bread(mtd, 1, 1, pagebuf);
+   nand_hex_line("p1    ", pagebuf, 16);
+diff --git a/boards/arm/stmp3770/hp39gii/src/hp39gii_kbd.c b/boards/arm/stmp3770/hp39gii/src/hp39gii_kbd.c
+index 860da0c4..bf60edaf 100644
+--- a/boards/arm/stmp3770/hp39gii/src/hp39gii_kbd.c
++++ b/boards/arm/stmp3770/hp39gii/src/hp39gii_kbd.c
+@@ -107,6 +107,7 @@ static const char g_alpha_map[128] =
+ static const uint8_t g_ascii_map[128] =
+ {
+   [KBD_KEY(0, 0)] = ' ',   /* F1：没有空格键，用 F1 代替 */
++  [KBD_KEY(1, 1)] = '-',   /* F2：方便输入参数里的减号 */
+   [KBD_KEY(9, 0)] = '0',
+   [KBD_KEY(9, 1)] = '1',
+   [KBD_KEY(8, 2)] = '2',

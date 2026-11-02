@@ -1,0 +1,17 @@
+# build output
+.deps/
+dist/
+build/
+
+# python
+__pycache__/
+*.pyc
+
+# host tools
+host-tools/sbloader-hid
+host-tools/hiddump
+*.dSYM/
+
+# editor / os
+.DS_Store
+*.swp

@@ -1,0 +1,20 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: edwardzhu02 <explodingtnt@foxmail.com>
+Date: Sun, 1 Nov 2026 17:26:51 +0800
+Subject: [PATCH] stmp3770: document nuttx.sb (elftosb) generation for SDP
+
+---
+ arch/arm/src/stmp3770/STATUS.md | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/arch/arm/src/stmp3770/STATUS.md b/arch/arm/src/stmp3770/STATUS.md
+index a0d85a9c..95d81c2c 100644
+--- a/arch/arm/src/stmp3770/STATUS.md
++++ b/arch/arm/src/stmp3770/STATUS.md
+@@ -160,3 +160,6 @@ page0 经 `bread` 读回正确（0xFF 擦除态 / 真机 dump 时是 STMP 魔数
+   若 `arch/arm/src/board` 指向错误路径，检查 `.config` 里的 `CONFIG_ARCH_BOARD` / `CONFIG_ARCH_CHIP` 字符串
+ - 板级 `src/Makefile` 的 CSRCS 仍是硬编码的
+ - 改了头文件依赖后要 `touch` 源文件强制重编
++- 真机 SDP 用的 `nuttx.sb`（BootStream）由 elftosb 生成：
++  `ExistOS-For-HP39GII/tools/sbtools/elftosb -o nuttx.sb -c ExistOS-For-HP39GII/Script/build_fw.bd nuttx.bin`
++  （`build_fw.bd` 里 `load inputFile > 0x0000` 是 CMD_LOAD_AT，会把裸二进制当 bin 载入，最后 jump 0x0000）

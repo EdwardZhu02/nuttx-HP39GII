@@ -1,0 +1,124 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+env:
+  GIT_TERMINAL_PROMPT: 0
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Every image this repository can produce, from a clean checkout.
+  # ---------------------------------------------------------------------------
+  firmware:
+    name: firmware (ubuntu 22.04)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config python3 \
+            libcrypto++-dev libusb-1.0-0-dev libudev-dev
+
+      # Ubuntu 22.04's gcc-arm-none-eabi is 10.3, the same version the port was
+      # verified with; using it directly would avoid the download below, but the
+      # Arm tarball is what ExistOS and the hardware bring-up used, so pin that.
+      - name: Cache arm-none-eabi
+        id: tc
+        uses: actions/cache@v4
+        with:
+          path: /opt/gcc-arm-none-eabi-10.3-2021.10
+          key: arm-none-eabi-10.3-2021.10-x86_64-linux-v1
+
+      - name: Install arm-none-eabi 10.3
+        if: steps.tc.outputs.cache-hit != 'true'
+        run: |
+          curl -sSL -o /tmp/tc.tar.bz2 \
+            "https://developer.arm.com/-/media/Files/downloads/gnu-rm/10.3-2021.10/gcc-arm-none-eabi-10.3-2021.10-x86_64-linux.tar.bz2"
+          sudo tar -xf /tmp/tc.tar.bz2 -C /opt
+          rm -f /tmp/tc.tar.bz2
+
+      - name: Put the toolchain on PATH
+        run: echo "/opt/gcc-arm-none-eabi-10.3-2021.10/bin" >> "$GITHUB_PATH"
+
+      - name: Show toolchain
+        run: arm-none-eabi-gcc --version | head -1
+
+      - name: Fetch pinned upstream trees
+        run: ./scripts/fetch-deps.sh
+
+      - name: Build elftosb
+        run: ./scripts/build-sbtools.sh
+
+      - name: Build NuttX
+        run: ./scripts/build-nuttx.sh
+
+      - name: Build boot menu
+        run: ./scripts/build-firmware.sh bootmenu
+
+      - name: Build recovery firmware
+        run: |
+          ./scripts/build-firmware.sh nandrestore
+          ./scripts/build-firmware.sh nanddump
+          ./scripts/build-firmware.sh nanddump-full
+          ./scripts/build-firmware.sh probe
+          ./scripts/build-firmware.sh loader
+
+      - name: Check host tools
+        run: make -C host-tools check
+
+      - name: Summarise artifacts
+        run: |
+          cd dist
+          sha256sum ./*.sb ./*.bin > SHA256SUMS
+          {
+            echo '### Artifacts'
+            echo
+            echo '| file | bytes | sha256 |'
+            echo '|---|---|---|'
+            for f in *.sb *.bin; do
+              printf '| `%s` | %d | `%s` |\n' "$f" "$(stat -c %s "$f")" "$(sha256sum "$f" | cut -c1-16)"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat SHA256SUMS
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: hp39gii-firmware
+          path: dist/
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.sb
+            dist/nuttx.bin
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
+
+  # ---------------------------------------------------------------------------
+  # The macOS-only half: the HID loader and the Python tools.
+  # ---------------------------------------------------------------------------
+  host-tools:
+    name: host tools (macOS)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build HID loader and check python tools
+        run: |
+          make -C host-tools
+          make -C host-tools check
+
+      - name: Report the loader signature
+        run: ./host-tools/sbloader-hid 2>&1 | head -5 || true

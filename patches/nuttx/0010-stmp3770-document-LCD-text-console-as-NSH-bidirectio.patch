@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: edwardzhu02 <explodingtnt@foxmail.com>
+Date: Sun, 1 Nov 2026 17:24:20 +0800
+Subject: [PATCH] stmp3770: document LCD text console as NSH bidirectional
+ console
+
+---
+ arch/arm/src/stmp3770/STATUS.md | 29 +++++++++++++++++++++++++----
+ 1 file changed, 25 insertions(+), 4 deletions(-)
+
+diff --git a/arch/arm/src/stmp3770/STATUS.md b/arch/arm/src/stmp3770/STATUS.md
+index 8ca58bcc..a0d85a9c 100644
+--- a/arch/arm/src/stmp3770/STATUS.md
++++ b/arch/arm/src/stmp3770/STATUS.md
+@@ -120,13 +120,34 @@ page0 经 `bread` 读回正确（0xFF 擦除态 / 真机 dump 时是 STMP 魔数
+ - 格式化流程要照 `mksmartfs`：BIOC_LLFORMAT + BIOC_ALLOCSECT + BIOC_WRITESECT 标记根目录，
+   否则 open(O_CREAT) 报 EIO。
+ 
++## LCD 文本控制台成为 NSH 的完整双向控制台 ✅
++
++`/dev/lcdcon` 之前只有写（LCD 出字）。这轮补上读路径并把它接到 NSH：
++
++- 键盘扫描线程把字符 `stmp3770_lcdcon_inject()` 进一个 64 字节环形缓冲（计数信号量），
++  `read()` 阻塞取字符 —— 真机 NSH 的 stdin 就靠这条。
++- `stmp3770_lcdcon_initialize()` 里不再 `clear()`（clear 需要面板硬件），改为在
++  `board_late_initialize()` 早期注册设备 + 初始化输入信号量，避免键盘在 register 之前
++  注入触发未初始化信号量。
++- `CONFIG_NSH_ALTCONDEV=y` + `NSH_ALTSTD{IN,OUT,ERR}="/dev/lcdcon"` 时，面板在
++  `board_late_initialize()` 里**同步**初始化（不再放延迟线程），否则 NSH 的第一批输出
++  会落在还没上电的 LCDIF 上而丢字。
++- 写路径（`lcdcon_write`）处理 CR/LF/退格/滚屏，32×16 文本。
++
++**EmuGII 验证**：串口日志里 NSH banner 消失（重定向成功）；screendump 抓帧、按 8×8 点阵
++逐格比对，面板上解码出 `NuttShell (NSH)` / `nsh> `；`inject('Q')->read()` 回读 `Q`。
++
++至此软件侧基本完成：NSH（LCD 输出 + 键盘输入）、NAND->MTD->SmartFS 文件系统、
++中断/节拍/LCD/GPMI/ECC8 全部在 EmuGII 验证。**剩下只有真机 SDP 验证**（需人工拔电池、
++按住 ON/C 插 USB 进 BootROM）。
++
+ ## 下一步
+ 
+-1. ~~键盘矩阵~~ ✅ 扫描/翻译/ECHO 验证 + 控制台注入回显/解析全部打通
+-2. LCDIF 的 ISR（`STMP3770_IRQ_LCDIF_DMA` 源 45），把帧写入的轮询判完成换成信号量
+-3. 面板像素对齐：现在横条内部有细碎噪点，怀疑是每行只写 256 字节、面板实际 258 列
++1. ~~键盘矩阵~~ ✅ 扫描/翻译/ECHO + 控制台注入 + LCD 控制台注入全部打通
++2. LCDIF 的 ISR（`STMP3770_IRQ_LCDIF_DMA` 源 45），把帧写入的轮询判完成换成信号量（可选优化）
++3. 面板像素对齐：横条内部有细碎噪点，怀疑每行只写 256 字节、面板实际 258 列（真机确认前先记着）
+ 4. ~~GPMI + ECC8 NAND~~ ✅ 读/写/擦已在 EmuGII 对真机 128MB dump 验证（page0=STMP 魔数一致）
+-5. 真机验证：`nuttx.sb` 经 SDP 载入（真机无外露串口，需要先有面板输出——现在已经有了）
++5. **真机验证**：`nuttx.sb` 经 SDP 载入（真机无外露串口，面板输出 + 键盘输入就是控制台）
+ 
+ ## 环境备忘
+ 

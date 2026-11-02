@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: edwardzhu02 <explodingtnt@foxmail.com>
+Date: Sun, 1 Nov 2026 17:02:45 +0800
+Subject: [PATCH] stmp3770: enable SmartFS in defconfig + document filesystem
+ status
+
+---
+ arch/arm/src/stmp3770/STATUS.md                   | 14 ++++++++++----
+ boards/arm/stmp3770/hp39gii/configs/nsh/defconfig |  8 ++++++++
+ 2 files changed, 18 insertions(+), 4 deletions(-)
+
+diff --git a/arch/arm/src/stmp3770/STATUS.md b/arch/arm/src/stmp3770/STATUS.md
+index c186504f..8ca58bcc 100644
+--- a/arch/arm/src/stmp3770/STATUS.md
++++ b/arch/arm/src/stmp3770/STATUS.md
+@@ -109,10 +109,16 @@ ECHO/ICANON/ICRNL，`uart_readv` 因此走 raw 路径（不回显、不拼行）
+ NuttX MTD 封装（`stmp3770_mtd.c`）已落地：erase/bread/bwrite/read/ioctl 全部就位，
+ page0 经 `bread` 读回正确（0xFF 擦除态 / 真机 dump 时是 STMP 魔数）。
+ 
+-**文件系统（SmartFS）仍在调**：`smart_initialize` 的 `smart_scan` 会在扫描 128MB NAND 时
+-发生 data abort，崩溃点在 `stmp3770_kbd_scan`（PC 0x26abc）——是内存被破坏（怀疑 GPMI
+-DMA 页读/写路径的缓冲对齐/归属问题），非 NAND 驱动本身。原始读/写/擦与 MTD bread 都已验证，
+-文件系统这层留给下一步深挖（换 LittleFS 或查 DMA 缓冲对齐）。
++**文件系统（SmartFS）已通**：GPMI NAND -> MTD -> SmartFS 格式化/挂载 -> 文件写读全链路
++在 EmuGII 跑通（"hello-from-nand" 写读一致）。
++
++过程中踩的坑（都已修）：
++- MTD `bread`/`bwrite` 必须返回**块数**（不是字节数），SmartFS 按块数比对。
++- 测试用 pagebuf 尺寸要对齐一页（2048B）；之前的 32B 让 GPMI DMA 溢出、冲掉键盘 BSS
++  全局变量，就是那个 `stmp3770_kbd_scan` data abort（DFAR=0xffffffff）的根因。
++- `smart_initialize` 的 partname 传 NULL 才是 `/dev/smart0`。
++- 格式化流程要照 `mksmartfs`：BIOC_LLFORMAT + BIOC_ALLOCSECT + BIOC_WRITESECT 标记根目录，
++  否则 open(O_CREAT) 报 EIO。
+ 
+ ## 下一步
+ 
+diff --git a/boards/arm/stmp3770/hp39gii/configs/nsh/defconfig b/boards/arm/stmp3770/hp39gii/configs/nsh/defconfig
+index 8ca6d912..ba701581 100644
+--- a/boards/arm/stmp3770/hp39gii/configs/nsh/defconfig
++++ b/boards/arm/stmp3770/hp39gii/configs/nsh/defconfig
+@@ -26,6 +26,14 @@ CONFIG_BOARD_LOOPSPERMSEC=4287
+ CONFIG_BOOT_RUNFROMISRAM=y
+ CONFIG_FAT_LCNAMES=y
+ CONFIG_FAT_LFN=y
++CONFIG_MTD=y
++CONFIG_MTD_SMART=y
++CONFIG_MTD_SMART_SECTOR_SIZE=2048
++CONFIG_MTD_SMART_WEAR_LEVEL=y
++CONFIG_FS_SMARTFS=y
++CONFIG_SMARTFS_ALIGNED_ACCESS=y
++CONFIG_SMARTFS_ERASEDSTATE=0xff
++CONFIG_SMARTFS_MAXNAMLEN=16
+ CONFIG_FS_FAT=y
+ CONFIG_HOST_WINDOWS=y
+ CONFIG_IDLETHREAD_STACKSIZE=1024

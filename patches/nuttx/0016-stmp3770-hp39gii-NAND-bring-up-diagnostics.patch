@@ -1,0 +1,183 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: edwardzhu02 <explodingtnt@foxmail.com>
+Date: Sun, 1 Nov 2026 22:10:55 +0800
+Subject: [PATCH] stmp3770/hp39gii: NAND bring-up diagnostics
+
+The first page read hangs on hardware: init (reset + ID) completes but
+the ECC8 read never finishes.
+
+- Bound the waits in GPMI_ReadPage (channel semaphore and the aux-buffer
+  sentinel poll).  A failed read now returns instead of wedging the whole
+  system, which also makes the failure observable.
+- Expose the ID bytes read by GPMI_GetNANDInfo.
+- Board test: print the ID, MTD geometry and a marker before each page
+  read, and use an 8 KB page buffer so a bogus geometry cannot overrun
+  the old 2 KB buffer.
+
+EmuGII: id ec dc 10 95 54 ff, blk 2048, erase 131072, count 1024.
+---
+ arch/arm/src/stmp3770/stmp3770_gpmi.c         | 30 ++++++-
+ .../arm/stmp3770/hp39gii/src/hp39gii_boot.c   | 80 ++++++++++++++++---
+ 2 files changed, 96 insertions(+), 14 deletions(-)
+
+diff --git a/arch/arm/src/stmp3770/stmp3770_gpmi.c b/arch/arm/src/stmp3770/stmp3770_gpmi.c
+index 57679df6..c43ffb48 100644
+--- a/arch/arm/src/stmp3770/stmp3770_gpmi.c
++++ b/arch/arm/src/stmp3770/stmp3770_gpmi.c
+@@ -1011,8 +1011,18 @@ static inline void   GPMI_ReadPage(uint32_t ColumnAddress, uint32_t RowAddress,
+     //INFO("Start READ\n");
+     volatile uint8_t *cmdBuf = (uint8_t *)FlashSendCommandBuffer;
+ 
+-    while ((HW_APBH_CHn_SEMA(NAND_DMA_Channel).B.INCREMENT_SEMA) && !ECC_FIN)
+-        ;
++    /* bring-up 兜底：通道一直不释放就放弃，别把整个系统锁死。 */
++
++    {
++        uint32_t spin = 0;
++
++        while ((HW_APBH_CHn_SEMA(NAND_DMA_Channel).B.INCREMENT_SEMA) &&
++               !ECC_FIN)
++            {
++                if (++spin > 20000000u)
++                    break;
++            }
++    }
+ 
+     cmdBuf[0] = NAND_CMD_READ0;
+     cmdBuf[1] = ColumnAddress & 0xFF;
+@@ -1064,8 +1074,15 @@ static inline void   GPMI_ReadPage(uint32_t ColumnAddress, uint32_t RowAddress,
+         while(HW_APBH_CHn_DEBUG2(NAND_DMA_Channel).B.APB_BYTES);
+         //portDelayus(100);
+ 
+-        while(probe[16] == 0x23)
+-            ;
++        {
++            uint32_t spin = 0;
++
++            while(probe[16] == 0x23)
++            {
++                if (++spin > 20000000u)
++                    break;
++            }
++        }
+ }
+ 
+ static inline void    GPMI_EraseBlock(uint32_t blockAddress, bool block)
+@@ -1440,6 +1457,11 @@ void portMTDDeviceInit(mtdInfo_t *mtdinfo)
+ }
+ //static uint32_t lastRDPage = 0xFFFFFFFF;
+ 
++FAR const uint8_t *stmp3770_nand_id(void)
++{
++    return (FAR const uint8_t *)FlashRecCommandBuffer;
++}
++
+ void portMTDReadPage(uint32_t page, uint8_t *buf)
+ {
+     /*
+diff --git a/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c b/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c
+index 771ec885..0e9b7bb1 100644
+--- a/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c
++++ b/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c
+@@ -198,14 +198,55 @@ static void nand_hex_line(FAR const char *tag, FAR const uint8_t *p, int n)
+   stmp3770_lcdcon_puts(line);
+ }
+ 
+-/* 只读冒烟测试：初始化 GPMI/ECC8，读几页看内容。
++/* 打一个十进制数（带标签）到 LCD 控制台。 */
++
++static void nand_print_num(FAR const char *tag, uint32_t v)
++{
++  char b[48];
++  char t[12];
++  int n = 0;
++  int k = 0;
++
++  while (*tag != 0)
++    {
++      b[n++] = *tag++;
++    }
++
++  if (v == 0)
++    {
++      t[k++] = '0';
++    }
++
++  while (v != 0)
++    {
++      t[k++] = (char)('0' + (v % 10));
++      v /= 10;
++    }
++
++  while (k > 0)
++    {
++      b[n++] = t[--k];
++    }
++
++  b[n++] = 0x0d;
++  b[n++] = 0x0a;
++  b[n]   = 0;
++
++  stmp3770_lcdcon_puts(b);
++}
++
++/* 只读冒烟测试：初始化 GPMI/ECC8，打印 ID 与几何，再读几页。
+  * 绝不写 NAND —— 真机上存的是原厂固件，写坏了要整片回刷。 */
+ 
+ static int hp39gii_nand_thread(int argc, char **argv)
+ {
+   FAR struct mtd_dev_s *mtd;
+-  static uint32_t pagebuf[2048 / 4];
+-  FAR uint8_t *p = (FAR uint8_t *)pagebuf;
++  struct mtd_geometry_s geo;
++  FAR const uint8_t *id;
++  extern FAR const uint8_t *stmp3770_nand_id(void);
++  static uint8_t pagebuf[8192] __attribute__((aligned(4)));
++
++  memset(&geo, 0, sizeof(geo));
+ 
+   sleep(3);
+ 
+@@ -220,16 +261,35 @@ static int hp39gii_nand_thread(int argc, char **argv)
+ 
+   stmp3770_lcdcon_puts("NAND init OK\r\n");
+ 
+-  mtd->bread(mtd, 0, 1, p);
+-  nand_hex_line("p0    ", p, 16);
++  id = stmp3770_nand_id();
++  nand_hex_line("id    ", id, 6);
++
++  if (mtd->ioctl(mtd, MTDIOC_GEOMETRY, (unsigned long)&geo) == OK)
++    {
++      nand_print_num("blk   ", (uint32_t)geo.blocksize);
++      nand_print_num("erase ", (uint32_t)geo.erasesize);
++      nand_print_num("count ", (uint32_t)geo.neraseblocks);
++    }
++
++  if (geo.blocksize == 0 || geo.blocksize > sizeof(pagebuf))
++    {
++      stmp3770_lcdcon_puts("bad geometry, stop\r\n");
++      return 0;
++    }
++
++  stmp3770_lcdcon_puts("read p0\r\n");
++  mtd->bread(mtd, 0, 1, pagebuf);
++  nand_hex_line("p0    ", pagebuf, 16);
+ 
+-  mtd->bread(mtd, 1, 1, p);
+-  nand_hex_line("p1    ", p, 16);
++  stmp3770_lcdcon_puts("read p1\r\n");
++  mtd->bread(mtd, 1, 1, pagebuf);
++  nand_hex_line("p1    ", pagebuf, 16);
+ 
+-  mtd->bread(mtd, 1984, 1, p);
+-  nand_hex_line("p1984 ", p, 16);
++  stmp3770_lcdcon_puts("read p1984\r\n");
++  mtd->bread(mtd, 1984, 1, pagebuf);
++  nand_hex_line("p1984 ", pagebuf, 16);
+ 
+-  stmp3770_lcdcon_puts("NAND read done\r\n");
++  stmp3770_lcdcon_puts("NAND done\r\n");
+   return 0;
+ }
+ 

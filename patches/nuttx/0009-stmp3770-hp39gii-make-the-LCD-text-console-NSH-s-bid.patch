@@ -1,0 +1,240 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: edwardzhu02 <explodingtnt@foxmail.com>
+Date: Sun, 1 Nov 2026 17:24:00 +0800
+Subject: [PATCH] stmp3770/hp39gii: make the LCD text console NSH's
+ bidirectional console
+
+Add keyboard input to /dev/lcdcon (inject + blocking read via a counting
+semaphore), wire the keyboard scan thread to inject into it, register the
+device before NSH starts, and when CONFIG_NSH_ALTCONDEV is selected
+initialize the panel synchronously in board_late_initialize so NSH's first
+output is not lost to the not-yet-powered LCDIF.
+
+Verified in EmuGII QEMU: the NSH banner and prompt render on the LCD panel
+("NuttShell (NSH)" / "nsh>") and the inject->sem->read round-trip returns
+the injected character. This is the console path the real hardware will
+use, since the HP 39gII has no exposed UART.
+---
+ arch/arm/src/stmp3770/stmp3770_lcdcon.c       | 55 ++++++++++++++++++-
+ arch/arm/src/stmp3770/stmp3770_lcdcon.h       |  1 +
+ .../stmp3770/hp39gii/configs/nsh/defconfig    |  4 ++
+ .../arm/stmp3770/hp39gii/src/hp39gii_boot.c   | 46 +++++++++++++++-
+ boards/arm/stmp3770/hp39gii/src/hp39gii_kbd.c |  6 ++
+ 5 files changed, 110 insertions(+), 2 deletions(-)
+
+diff --git a/arch/arm/src/stmp3770/stmp3770_lcdcon.c b/arch/arm/src/stmp3770/stmp3770_lcdcon.c
+index 03630984..d182b8e2 100644
+--- a/arch/arm/src/stmp3770/stmp3770_lcdcon.c
++++ b/arch/arm/src/stmp3770/stmp3770_lcdcon.c
+@@ -3,6 +3,8 @@
+ #include <string.h>
+ #include "stmp3770_lcdcon.h"
+ #include <nuttx/fs/fs.h>
++#include <nuttx/irq.h>
++#include <nuttx/semaphore.h>
+ #include "display_up.h"
+ 
+ #define COLS 32
+@@ -218,6 +220,56 @@ void stmp3770_lcdcon_puts(FAR const char *s)
+     }
+ }
+ 
++/* 输入环形缓冲：键盘扫描线程把字符 inject 进来，read() 阻塞取出。 */
++
++#define LCDCON_INSIZE 64
++
++static char g_inbuf[LCDCON_INSIZE];
++static volatile size_t g_inhead;
++static volatile size_t g_intail;
++static sem_t g_insem;
++
++void stmp3770_lcdcon_inject(char ch)
++{
++  irqstate_t flags = enter_critical_section();
++  size_t next = (g_inhead + 1) % LCDCON_INSIZE;
++
++  if (next != g_intail)
++    {
++      g_inbuf[g_inhead] = ch;
++      g_inhead = next;
++      nxsem_post(&g_insem);
++    }
++
++  leave_critical_section(flags);
++}
++
++static ssize_t lcdcon_read(FAR struct file *filep, FAR char *buffer,
++                           size_t buflen)
++{
++  size_t i = 0;
++
++  while (i < buflen)
++    {
++      irqstate_t flags;
++      char ch;
++
++      while (g_inhead == g_intail)
++        {
++          nxsem_wait(&g_insem);
++        }
++
++      flags = enter_critical_section();
++      ch = g_inbuf[g_intail];
++      g_intail = (g_intail + 1) % LCDCON_INSIZE;
++      leave_critical_section(flags);
++
++      buffer[i++] = ch;
++    }
++
++  return (ssize_t)i;
++}
++
+ /* 字符设备封装：把 /dev/lcdcon 的 write() 接到文本控制台。 */
+ 
+ static ssize_t lcdcon_write(FAR struct file *filep,
+@@ -235,11 +287,12 @@ static ssize_t lcdcon_write(FAR struct file *filep,
+ 
+ static const struct file_operations g_lcdcon_fops =
+ {
++  .read  = lcdcon_read,
+   .write = lcdcon_write,
+ };
+ 
+ int stmp3770_lcdcon_initialize(void)
+ {
+-  stmp3770_lcdcon_clear();
++  nxsem_init(&g_insem, 0, 0);
+   return register_driver("/dev/lcdcon", &g_lcdcon_fops, 0666, NULL);
+ }
+diff --git a/arch/arm/src/stmp3770/stmp3770_lcdcon.h b/arch/arm/src/stmp3770/stmp3770_lcdcon.h
+index f0cccb0c..d2708e85 100644
+--- a/arch/arm/src/stmp3770/stmp3770_lcdcon.h
++++ b/arch/arm/src/stmp3770/stmp3770_lcdcon.h
+@@ -9,5 +9,6 @@ void stmp3770_lcdcon_clear(void);
+ void stmp3770_lcdcon_putc(int ch);
+ void stmp3770_lcdcon_puts(FAR const char *s);
+ int stmp3770_lcdcon_initialize(void);
++void stmp3770_lcdcon_inject(char ch);
+ 
+ #endif
+diff --git a/boards/arm/stmp3770/hp39gii/configs/nsh/defconfig b/boards/arm/stmp3770/hp39gii/configs/nsh/defconfig
+index ba701581..68830540 100644
+--- a/boards/arm/stmp3770/hp39gii/configs/nsh/defconfig
++++ b/boards/arm/stmp3770/hp39gii/configs/nsh/defconfig
+@@ -42,6 +42,10 @@ CONFIG_INIT_STACKSIZE=1536
+ CONFIG_LINE_MAX=64
+ CONFIG_NSH_FILEIOSIZE=512
+ CONFIG_NSH_READLINE=y
++CONFIG_NSH_ALTCONDEV=y
++CONFIG_NSH_ALTSTDIN="/dev/lcdcon"
++CONFIG_NSH_ALTSTDOUT="/dev/lcdcon"
++CONFIG_NSH_ALTSTDERR="/dev/lcdcon"
+ CONFIG_POSIX_SPAWN_DEFAULT_STACKSIZE=1536
+ CONFIG_PREALLOC_TIMERS=4
+ CONFIG_PTHREAD_STACK_DEFAULT=1536
+diff --git a/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c b/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c
+index 5a382113..9c562fc3 100644
+--- a/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c
++++ b/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c
+@@ -25,6 +25,7 @@
+ #include <arch/board/board.h>
+ 
+ #include <unistd.h>
++#include <fcntl.h>
+ 
+ #include "arm_internal.h"
+ #include "chip.h"
+@@ -121,10 +122,31 @@ static int hp39gii_lcd_thread(int argc, char **argv)
+   hp39gii_lcdtest();
+ 
+   hp39gii_puts("[LCD] text test\n");
+-  stmp3770_lcdcon_initialize();
++  stmp3770_lcdcon_clear();
+   stmp3770_lcdcon_puts("NuttX on HP 39gII\n");
+   stmp3770_lcdcon_puts("LCD console OK\n");
+ 
++  /* 自检 /dev/lcdcon 的读路径：真机上 NSH 靠这条读键盘。注入一个字符再
++   * 读回，验证 注入→信号量→read 整条链路。
++   */
++  {
++    int fd = open("/dev/lcdcon", O_RDWR);
++    if (fd >= 0)
++      {
++        char ch = 0;
++        stmp3770_lcdcon_inject('Q');
++        if (read(fd, &ch, 1) == 1)
++          {
++            hp39gii_printf("[LCD] readback=%c\n", ch);
++          }
++        close(fd);
++      }
++    else
++      {
++        hp39gii_printf("[LCD] open /dev/lcdcon failed: %d\n", fd);
++      }
++  }
++
+   hp39gii_puts("[LCD] ready\n");
+   return 0;
+ }
+@@ -281,7 +303,28 @@ void stmp3770_boardinitialize(void)
+ 
+ void board_late_initialize(void)
+ {
++#ifdef CONFIG_STMP3770_LCD
++  /* 提前注册 /dev/lcdcon（含输入信号量初始化），否则键盘线程可能在
++   * LCD 线程 register 之前就注入字符，触发未初始化信号量。
++   */
++  stmp3770_lcdcon_initialize();
++#endif
++
+ #ifdef CONFIG_STMP3770_LCD_INIT
++#ifdef CONFIG_NSH_ALTCONDEV
++  /* NSH 用 /dev/lcdcon 当控制台（真机无外露串口）。面板必须同步初始化好，
++   * 否则 NSH 的早期输出会落在尚未上电的 LCDIF 上而丢字。面板 reset→
++   * display-on 约 820ms 会拖慢启动，但对无串口的计算器这是正确取舍。
++   */
++
++  hp39gii_puts("[LCD] sync interface init\n");
++  portDispInterfaceInit();
++
++  hp39gii_puts("[LCD] sync device init\n");
++  portDispDeviceInit();
++
++  stmp3770_lcdcon_clear();
++#else
+   int ret;
+ 
+   ret = kthread_create("lcdinit", SCHED_PRIORITY_DEFAULT + 5,
+@@ -291,6 +334,7 @@ void board_late_initialize(void)
+       hp39gii_printf("[LCD] kthread_create failed: %d\n", ret);
+     }
+ #endif
++#endif
+ 
+ #ifdef CONFIG_STMP3770_NAND
+   {
+diff --git a/boards/arm/stmp3770/hp39gii/src/hp39gii_kbd.c b/boards/arm/stmp3770/hp39gii/src/hp39gii_kbd.c
+index d6179db5..8080cf5b 100644
+--- a/boards/arm/stmp3770/hp39gii/src/hp39gii_kbd.c
++++ b/boards/arm/stmp3770/hp39gii/src/hp39gii_kbd.c
+@@ -47,6 +47,7 @@
+ #include "arm_internal.h"
+ #include "chip.h"
+ #include "stmp3770.h"
++#include "stmp3770_lcdcon.h"
+ 
+ #ifdef CONFIG_STMP3770_KBD
+ 
+@@ -197,6 +198,11 @@ static void kbd_deliver(int ch)
+   }
+ #endif
+ 
++#ifdef CONFIG_STMP3770_LCD
++  /* 真机无外露串口：键盘同时喂给 LCD 控制台（/dev/lcdcon）。 */
++  stmp3770_lcdcon_inject((char)ch);
++#endif
++
+   (void)ch;
+ }
+ 

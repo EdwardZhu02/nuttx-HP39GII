@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: edwardzhu02 <explodingtnt@foxmail.com>
+Date: Sun, 1 Nov 2026 22:06:31 +0800
+Subject: [PATCH] stmp3770/hp39gii: F1 emits a space, add a bottom hint bar
+
+The 39gII has no space key, which makes NSH command lines awkward.  Map
+F1 (matrix 0,0) to ASCII space.
+
+Reserve the last panel row for a hint bar and give the text view 15
+rows.  The bar reads "F1=SPC  UP/DN=SCROLL  L/R=PAGE" and is redrawn by
+lcdcon_render(), so it survives scrolling and clear.
+---
+ arch/arm/src/stmp3770/stmp3770_lcdcon.c       | 26 ++++++++++++++++---
+ arch/arm/src/stmp3770/stmp3770_lcdcon.h       |  2 +-
+ boards/arm/stmp3770/hp39gii/src/hp39gii_kbd.c |  1 +
+ 3 files changed, 24 insertions(+), 5 deletions(-)
+
+diff --git a/arch/arm/src/stmp3770/stmp3770_lcdcon.c b/arch/arm/src/stmp3770/stmp3770_lcdcon.c
+index 7425bb1a..924ffffc 100644
+--- a/arch/arm/src/stmp3770/stmp3770_lcdcon.c
++++ b/arch/arm/src/stmp3770/stmp3770_lcdcon.c
+@@ -13,6 +13,13 @@
+ #define W (COLS * 8)  /* 256 */
+ #define H (ROWS * 8)  /* 128 */
+ 
++/* 最后一行固定作底部提示条，正文只用上面 TEXT_ROWS 行。 */
++
++#define TEXT_ROWS (ROWS - 1)
++#define HINT_ROW  (ROWS - 1)
++#define HINT_TEXT "F1=SPC  UP/DN=SCROLL  L/R=PAGE"
++
++
+ /* 8x8 bitmap font, ASCII 32..126, one byte per row (bit7 = leftmost). */
+ static const uint8_t g_font[95][8] =
+ {
+@@ -211,7 +218,7 @@ static char *lcdcon_line(int abs)
+ /* 屏幕顶部最靠下的位置（即显示最后 ROWS 行时） */
+ static int lcdcon_max_top(void)
+ {
+-  int m = g_ntotal - ROWS;
++  int m = g_ntotal - TEXT_ROWS;
+   return m > 0 ? m : 0;
+ }
+ 
+@@ -267,7 +274,7 @@ static void lcdcon_render(void)
+ 
+   memset(g_fb, 0xff, sizeof(g_fb));
+ 
+-  for (r = 0; r < ROWS; r++)
++  for (r = 0; r < TEXT_ROWS; r++)
+     {
+       int abs = g_top + r;
+ 
+@@ -279,6 +286,17 @@ static void lcdcon_render(void)
+       lcdcon_blit_line(r, lcdcon_line(abs));
+     }
+ 
++  /* 底部提示条 */
++  {
++    int c;
++    int len = sizeof(HINT_TEXT) - 1;
++
++    for (c = 0; c < COLS; c++)
++      {
++        lcdcon_blit(HINT_ROW, c, c < len ? HINT_TEXT[c] : ' ');
++      }
++  }
++
+   g_dirty0 = 0;
+   g_dirty1 = H - 1;
+ }
+@@ -315,7 +333,7 @@ void stmp3770_lcdcon_clear(void)
+ 
+ static bool lcdcon_visible(void)
+ {
+-  return g_line >= g_top && g_line < g_top + ROWS;
++  return g_line >= g_top && g_line < g_top + TEXT_ROWS;
+ }
+ 
+ /* 有新输出时回到屏幕底部（用户往回翻看后，一旦有新内容就跳回最新）。 */
+@@ -511,7 +529,7 @@ void stmp3770_lcdcon_putc(int ch)
+ 
+     ln[g_col] = (char)ch;
+ 
+-    if (row >= 0 && row < ROWS)
++    if (row >= 0 && row < TEXT_ROWS)
+       {
+         lcdcon_blit(row, g_col, ch);
+       }
+diff --git a/arch/arm/src/stmp3770/stmp3770_lcdcon.h b/arch/arm/src/stmp3770/stmp3770_lcdcon.h
+index e9cf8ca4..f4c1b2fe 100644
+--- a/arch/arm/src/stmp3770/stmp3770_lcdcon.h
++++ b/arch/arm/src/stmp3770/stmp3770_lcdcon.h
+@@ -6,7 +6,7 @@
+ /* 8x8 text console rendered onto the 256x128 LCD. 32 cols x 16 rows. */
+ 
+ #define STMP3770_LCDCON_COLS 32
+-#define STMP3770_LCDCON_ROWS 16
++#define STMP3770_LCDCON_ROWS 15   /* 正文行数；面板最后一行是提示条 */
+ 
+ void stmp3770_lcdcon_clear(void);
+ void stmp3770_lcdcon_putc(int ch);
+diff --git a/boards/arm/stmp3770/hp39gii/src/hp39gii_kbd.c b/boards/arm/stmp3770/hp39gii/src/hp39gii_kbd.c
+index 5b03c6c4..860da0c4 100644
+--- a/boards/arm/stmp3770/hp39gii/src/hp39gii_kbd.c
++++ b/boards/arm/stmp3770/hp39gii/src/hp39gii_kbd.c
+@@ -106,6 +106,7 @@ static const char g_alpha_map[128] =
+ 
+ static const uint8_t g_ascii_map[128] =
+ {
++  [KBD_KEY(0, 0)] = ' ',   /* F1：没有空格键，用 F1 代替 */
+   [KBD_KEY(9, 0)] = '0',
+   [KBD_KEY(9, 1)] = '1',
+   [KBD_KEY(8, 2)] = '2',
