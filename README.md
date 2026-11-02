@@ -58,7 +58,8 @@ cd nuttx-HP39GII
 ./scripts/build-all.sh       # everything below, into dist/
 ```
 
-`build-all.sh` runs, in order:
+`build-all.sh` runs, in order (add `make -C host-tools` on macOS for the USB
+loader):
 
 ```bash
 ./scripts/build-sbtools.sh                 # elftosb, from the ExistOS tree
@@ -75,6 +76,8 @@ cd nuttx-HP39GII
 Full detail, including the recovery ladder, is in [docs/flashing.md](docs/flashing.md).
 
 ```bash
+make -C host-tools                                   # sbloader-hid, macOS only
+
 # 1. calculator into the boot ROM: pull the battery, hold ON/C, plug in USB
 #    (USB ID 066f:3770)
 ./host-tools/sbloader-hid dist/nanddump-full.sb      # macOS
