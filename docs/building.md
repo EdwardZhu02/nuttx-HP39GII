@@ -181,6 +181,12 @@ same files to the release. A second job builds the macOS host tools, because tha
 is the only place `sbloader-hid` compiles.
 
 The workflow is the reference for a known-good build; if the local build fails and
-CI is green, compare the toolchain version first. `.deps/` is deliberately not
+CI is green, compare the toolchain version first.
+
+One trap that is not obvious from the YAML: **a new repository gives `GITHUB_TOKEN`
+read-only access**, so the release step fails with `403 Resource not accessible by
+integration`. The workflow asks for `contents: write`, but that only works if
+Settings → Actions → General → Workflow permissions allows it. Check that box before
+pushing a tag. `.deps/` is deliberately not
 cached: the pinned clones are cheap, and a stale patched tree is an expensive bug
 to chase.

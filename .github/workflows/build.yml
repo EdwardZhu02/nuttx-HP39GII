@@ -7,6 +7,13 @@ on:
   pull_request:
   workflow_dispatch:
 
+# The release step writes tags and release assets. New repositories default to a
+# read-only GITHUB_TOKEN, and that cannot be overridden from inside a workflow
+# unless the repository allows it -- check Settings > Actions > General if this
+# job fails with 403 "Resource not accessible by integration".
+permissions:
+  contents: write
+
 env:
   GIT_TERMINAL_PROMPT: 0
 
