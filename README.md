@@ -13,12 +13,13 @@ Three things are built here:
 
 | Component | What it is | Where it runs |
 |---|---|---|
-| **NuttX port** | `arch/arm/src/stmp3770` + `boards/arm/stmp3770/hp39gii` — 20 patch commits on top of Apache NuttX | calculator (after the menu hands over) |
+| **NuttX port** | `arch/arm/src/stmp3770` + `boards/arm/stmp3770/hp39gii` — 22 patch commits on top of Apache NuttX | calculator (after the menu hands over) |
 | **Boot menu** | an OSLoader variant of [ExistOS](https://github.com/ExistOS-Team/ExistOS-For-HP39GII) that loads NuttX from NAND and offers the stock system as a (disabled) second entry | calculator, loaded by the boot ROM |
 | **Recovery firmware** | `nandrestore` / `nanddump` / `probe`: RAM-only firmware that talks to a host over USB CDC | calculator, loaded by the boot ROM over USB |
 
-Plus the host tools (`install_menu.py`, `nanddump.py`, `nandrestore.py`, `sbloader-hid`)
-and scripts that produce every image from a clean checkout.
+Plus the host tools (`install_menu.py`, `nanddump.py`, `nandrestore.py`,
+`split-nand.py`, `sbloader-hid`) and scripts that produce every image from a clean
+checkout.
 
 ## Status
 
@@ -40,7 +41,7 @@ Verified on real hardware unless marked otherwise.
 | LCD framebuffer / graphics beyond the 32×16 text console | ❌ not implemented |
 | Linux on this device | ❌ impossible — 512 KB of RAM, see [docs/hardware.md](docs/hardware.md#there-is-no-dram) |
 
-NuttX uses about 150 KB of the 512 KB SRAM (29 %), so roughly 370 KB is left for the
+NuttX uses about 186 KB of the 512 KB SRAM (36 %), so roughly 320 KB is left for the
 heap, the SmartFS cache and applications.
 
 ## Quick start
@@ -76,19 +77,22 @@ Full detail, including the recovery ladder, is in [docs/flashing.md](docs/flashi
 ```bash
 # 1. calculator into the boot ROM: pull the battery, hold ON/C, plug in USB
 #    (USB ID 066f:3770)
-./host-tools/sbloader-hid dist/nandrestore.sb        # macOS
-#   Linux: .deps/existos/tools/sbtools/sbloader -d dist/nandrestore.sb
+./host-tools/sbloader-hid dist/nanddump-full.sb      # macOS
+#   Linux: .deps/existos/tools/sbtools/sbloader -d dist/nanddump-full.sb
 
-# 2. write a full backup of the stock NAND, before anything else
-python3 host-tools/nanddump.py -o nand-full.bin
+# 2. copy the stock NAND out, before anything writes to it (~8 minutes)
+python3 host-tools/nanddump.py -o nand-full.raw -n 65536
+python3 host-tools/split-nand.py --split nand-full.raw --out nand-full
 
-# 3. back into the boot ROM, load the install firmware again, then write
-#    the menu (block 240) and NuttX (block 243)
+# 3. power-cycle, back into the boot ROM, load the install firmware
+./host-tools/sbloader-hid dist/nandrestore.sb
+
+# 4. write the menu (block 240) and NuttX (block 243), then point the boot ROM
+#    at the menu -- two separate commands, on purpose
 python3 host-tools/install_menu.py --images dist/bootmenu.sb - dist/nuttx.bin \
         --nx-header --delay 0.003
-
-# 4. point the boot ROM's LDLB records at the menu
-python3 host-tools/install_menu.py --ldlb
+python3 host-tools/install_menu.py --ldlb --backup-data nand-full.data \
+        --backup-oob nand-full.oob
 ```
 
 Power-cycle: the menu appears, press **DOWN** then **ENTER** (entry 1, "HP OS", is
@@ -97,13 +101,15 @@ selected by default and is not available).
 To go back to the stock firmware, restore the LDLB records:
 
 ```bash
-python3 host-tools/install_menu.py --restore-ldlb
+python3 host-tools/install_menu.py --restore-ldlb --backup-data nand-full.data \
+        --backup-oob nand-full.oob
 ```
 
 ## Repository layout
 
 ```
-patches/nuttx/     21 patches: the SoC port + board support, against a pinned NuttX
+patches/nuttx/     22 patches: the SoC port + board support, against a pinned NuttX
+patches/apps/       1 patch:   the nshlib "clear" command
 patches/existos/    2 patches: the NAND dump/restore firmware and the boot menu
 scripts/            fetch, configure, build, package (see docs/building.md)
 host-tools/         host side of the USB protocols, and the macOS SDP loader
@@ -138,5 +144,5 @@ the patch series, so there are no nested repositories and no vendored sources.
   measured and which were inferred.
 
 Licensing: `scripts/` and `host-tools/` are MIT (see [LICENSE](LICENSE));
-`patches/nuttx/` is Apache-2.0 and `patches/existos/` is GPL-3.0, matching the trees
-they apply to.
+`patches/nuttx/` and `patches/apps/` are Apache-2.0 and `patches/existos/` is GPL-3.0,
+matching the trees they apply to.

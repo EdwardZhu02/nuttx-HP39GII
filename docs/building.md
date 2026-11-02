@@ -45,10 +45,23 @@ sudo apt-get install build-essential cmake pkg-config \
 brew install cmake pkg-config crypto++ libusb
 ```
 
-`kconfig-frontends` is **not** needed: `configure.sh` only copies the board
-defconfig, and nothing in the build path runs `kconfig-conf`. That matters because
-`kconfig-frontends` has been dropped from recent distributions; you only need it
-if you want `make menuconfig`.
+`kconfig-frontends` is **not** needed. NuttX wants a kconfig implementation for
+two things, and both are covered without it:
+
+* `tools/configure.sh` ends in `tools/sethost.sh`, which calls `kconfig-tweak` to
+  rewrite the host selection. `scripts/tools/kconfig-tweak` is a 100-line stand-in
+  that implements the four operations `sethost.sh` uses; `build-nuttx.sh` puts it
+  on `PATH` when the real one is missing.
+* `make` re-runs `olddefconfig` whenever a `Kconfig` is newer than `.config`, and
+  `apps_preconfig` rewrites the apps' `Kconfig` files on every build, so that is
+  every build. NuttX prefers **kconfiglib** (a pip package) when `menuconfig` is
+  on `PATH`; kconfiglib ships `olddefconfig`, `menuconfig`, `savedefconfig` and
+  friends. If nothing is found, `build-nuttx.sh` installs kconfiglib into
+  `.deps/pylib` with `pip install --target` — no root, no virtualenv, no change
+  to your environment.
+
+If you do want the interactive configurator, either `pip3 install --user
+kconfiglib` (then `make menuconfig`) or install `kconfig-frontends`.
 
 ## Build
 
@@ -82,6 +95,12 @@ Expected sizes, so you can tell at a glance whether a build went wrong:
 
 The build also stops if `nuttx.bin` would overlap the page table at `0x7C000`.
 
+The `.sb` files are **not** bit-reproducible: `elftosb -z` emits a 16-byte key
+block whose contents vary per run, so two builds of the same sources produce
+different SHA256 sums for the stream (and the same `nuttx.bin` inside it). Compare
+`nuttx.bin`, or the extracted payload, if you need to know whether two builds are
+the same.
+
 ### NuttX configuration
 
 `.config` is generated once from `boards/arm/stmp3770/hp39gii/configs/nsh/defconfig`
@@ -90,7 +109,7 @@ first. If you change the defconfig, do it in the board directory and copy it bac
 
 ```bash
 cd .deps/nuttx
-make menuconfig                 # needs kconfig-frontends
+make menuconfig                 # needs kconfiglib or kconfig-frontends
 make savedefconfig              # produces a minimal defconfig
 cp defconfig boards/arm/stmp3770/hp39gii/configs/nsh/defconfig
 ```
