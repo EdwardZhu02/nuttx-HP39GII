@@ -1,0 +1,80 @@
+From f2fbe1b2dc1ec5ebe681c68d98d58c4ff105c481 Mon Sep 17 00:00:00 2001
+From: edwardzhu02 <explodingtnt@foxmail.com>
+Date: Tue, 3 Nov 2026 15:07:16 +0800
+Subject: [PATCH] nshlib: add the "khicas" command
+
+Starts the KhiCAS (giac) console on the HP 39gII NuttX port.  The engine is
+demand-paged from NAND by the board pager, so the command handler itself is
+two lines: it hands off to hp39gii_khicas_run(), which starts a kernel
+thread with a bigger stack and waits for it to return.
+
+Guarded by CONFIG_STMP3770_KHICAS, which only that board defines.
+---
+ nshlib/nsh.h         |  4 ++++
+ nshlib/nsh_command.c |  4 ++++
+ nshlib/nsh_syscmds.c | 19 +++++++++++++++++++
+ 3 files changed, 27 insertions(+)
+
+diff --git a/nshlib/nsh.h b/nshlib/nsh.h
+index 5a7d557..bbb227b 100644
+--- a/nshlib/nsh.h
++++ b/nshlib/nsh.h
+@@ -1096,6 +1096,10 @@ int cmd_irqinfo(FAR struct nsh_vtbl_s *vtbl, int argc, FAR char **argv);
+   int cmd_clear(FAR struct nsh_vtbl_s *vtbl, int argc, FAR char **argv);
+ #endif
+ 
++#ifdef CONFIG_STMP3770_KHICAS
++  int cmd_khicas(FAR struct nsh_vtbl_s *vtbl, int argc, FAR char **argv);
++#endif
++
+ #ifndef CONFIG_NSH_DISABLE_ENV
+   int cmd_env(FAR struct nsh_vtbl_s *vtbl, int argc, FAR char **argv);
+ #endif
+diff --git a/nshlib/nsh_command.c b/nshlib/nsh_command.c
+index 4af4ab0..6fa8955 100644
+--- a/nshlib/nsh_command.c
++++ b/nshlib/nsh_command.c
+@@ -185,6 +185,10 @@ static const struct cmdmap_s g_cmdmap[] =
+   CMD_MAP("clear",    cmd_clear,    1, 1, NULL),
+ #endif
+ 
++#ifdef CONFIG_STMP3770_KHICAS
++  CMD_MAP("khicas",   cmd_khicas,   1, 2, NULL),
++#endif
++
+ #ifndef CONFIG_NSH_DISABLE_CP
+   CMD_MAP("cp",       cmd_cp,       3, 4, "[-r] <source-path> <dest-path>"),
+ #endif
+diff --git a/nshlib/nsh_syscmds.c b/nshlib/nsh_syscmds.c
+index 9364856..fa1fdf3 100644
+--- a/nshlib/nsh_syscmds.c
++++ b/nshlib/nsh_syscmds.c
+@@ -168,6 +168,25 @@ typedef CODE int (*cmd_rpmsg_cb_t)(FAR int *cmd, FAR unsigned long * val,
+  * Public Functions
+  ****************************************************************************/
+ 
++#ifdef CONFIG_STMP3770_KHICAS
++/****************************************************************************
++ * Name: cmd_khicas
++ *
++ * Description:
++ *   Start the KhiCAS (giac) console.  The engine itself is demand-paged
++ *   from NAND by the STMP3770 pager.
++ *
++ ****************************************************************************/
++
++extern int hp39gii_khicas_run(int argc, FAR char **argv);
++
++int cmd_khicas(FAR struct nsh_vtbl_s *vtbl, int argc, FAR char **argv)
++{
++  UNUSED(vtbl);
++  return hp39gii_khicas_run(argc, argv);
++}
++#endif
++
+ /****************************************************************************
+  * Name: cmd_shutdown
+  ****************************************************************************/
+-- 
+2.53.0
+

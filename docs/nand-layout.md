@@ -36,13 +36,20 @@ block 238.
 | 8 | 512 | 2 pages | `LDLB` + `LDLB2` | `install_menu.py --ldlb` |
 | 12 | 768 | 2 pages | mirror of block 8 | `install_menu.py --ldlb` |
 | 238–239 | | | isolation gap, never written | — |
-| 240 | 15360 | 42 pages | **boot menu** sb1 stream (`load 0x30000; jump 0x30000`) | `--images` |
+| 240 | 15360 | 42 pages | **boot menu** sb1 stream (`load 0x50000; jump 0x50000`) | `--images` |
 | 241–242 | 15424 | 70 pages | stock boot section: `HPB1` + length + 143 136 bytes | optional, `--images` |
-| 243–244 | 15552 | 92 pages | NuttX: `NXB1` + length + `nuttx.bin` | `--images --nx-header` |
-| 245–1023 | | 779 blocks | **SmartFS** volume, `/dev/smart0` → `/mnt` | `mksmartfs` from NuttX |
+| 243–246 | 15552 | up to 256 pages | NuttX: `NXB1` + length + `nuttx.bin` (135 pages today) | `--images --nx-header` |
+| 247–799 | | 553 blocks | **SmartFS** volume, `/dev/smart0` → `/mnt` | `mksmartfs` from NuttX |
+| 800–1023 | | 224 blocks | **KhiCAS engine** staging area (`khicas.bin`) | `--khicas` |
 
-779 blocks is 97.4 MB of the 128 MB. Blocks 238 onwards were all `0xFF` in the stock
-image — no factory data, no bad-block table — which is why this area is safe to claim.
+Blocks 243..246 are reserved for NuttX even though the image only fills three of
+them: the menu lives at `0x50000`, so the image must stay below `0x4F000`, which is
+256 pages. The file system starts at 247 for the same reason — it used to start at
+245, back when the image fit in two blocks.
+
+553 + 224 blocks covers 97.4 MB of the 128 MB. Blocks 238 onwards were all `0xFF` in the
+stock image — no factory data, no bad-block table — which is why this area is safe to claim.
+Block 800 starts the engine, past the file system, so a file system format cannot eat it.
 
 ## Rules
 
@@ -57,7 +64,7 @@ recoverable, but you will need a full restore).
 **The menu never writes NAND.** It only reads blocks 240/241/243 to load images. A
 corrupt menu means you re-enter the boot ROM and reinstall it; it cannot spread.
 
-**NuttX writes only blocks 245..1023.** The volume is created with `mtd_partition()` over
+**NuttX writes only blocks 247..1023.** The volume is created with `mtd_partition()` over
 that range, so a SmartFS bug can lose files but cannot reach the stock area.
 
 **Block 4 is repaired, not ignored.** The first version of the partition code passed

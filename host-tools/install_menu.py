@@ -1,26 +1,23 @@
 #!/usr/bin/env python3
 """
-Install the dual-boot menu and its payloads into NAND.
+HP 39gII 双启动安装工具（配合 RAM 里的 nandrestore 固件，走 USB CDC）。
 
-Talks over USB CDC to the nandrestore firmware running from SRAM, and writes
-only the blocks the menu owns:
+把三样东西写进 NAND 的空闲区，再把块 8/12 的 LDLB 指向菜单固件：
 
-  block 240        menu firmware, an sb1 stream the boot ROM loads at 0x30000
-  block 241..242   stock boot section ("HPB1" + length + the decrypted stream)
-  block 243..244   NuttX image ("NXB1" + length + nuttx.bin)
-  block 8/12 page0 LDLB: start_sector -> 240*64, sectors -> menu page count
+  块 240        菜单固件 SB（由 BootROM 载入到 0x50000 执行）
+  块 241..242   原厂引导段（16 字节头 "HPB1" + 离线解密出的 SB 指令流）
+  块 243..246   NuttX 镜像（16 字节头 "NXB1" + nuttx.bin，最多 256 页）
+  块 800..1023  KhiCAS 分页引擎（khicas.bin，裸数据，在文件系统之外）
+  块 8/12 page0 LDLB：firmware_start_sector -> 240*64，sectors -> 菜单页数
 
-Nothing in blocks 0..239 is touched, except page 0 of blocks 8 and 12 (and page 1
-of those blocks, which has to be written back after the erase).
+块 0..239 里除了 8/12 的 page0（和它们被擦后必须写回的 page1）之外一律不动。
 
-Usage:
-  install_menu.py --images bootmenu.sb - dist/nuttx.bin --nx-header
-  install_menu.py --ldlb                 # repoint LDLB (run after --images)
-  install_menu.py --show                 # dump both LDLB pages
-  install_menu.py --restore-ldlb         # restore LDLB from the backup
-
-Pass "-" in place of an image to skip that slot; the stock boot section is
-optional and only used by the disabled "HP OS" menu entry.
+用法:
+  install_menu.py --images  menu.sb hp-boot-section.bin nuttx.bin --nx-header \
+                 --khicas khicas.bin
+  install_menu.py --ldlb                    # 只改 LDLB（先 --images 验证过再跑）
+  install_menu.py --show                    # 读出 LDLB 两页看看
+  install_menu.py --restore-ldlb            # 用备份把 LDLB 还原成原厂值
 """
 import argparse
 import glob
@@ -40,6 +37,10 @@ MENU_BLOCK = 240
 HP_BLOCK = 241
 NX_BLOCK = 243
 LDLB_BLOCKS = (8, 12)
+
+# KhiCAS 分页代码区（块 800..1023，裸数据）
+KHICAS_FIRST_BLOCK = 800
+KHICAS_BLOCKS = 224
 
 MAGIC_W, MAGIC_B, MAGIC_P, MAGIC_R, MAGIC_E = b"PNR1", b"PNR4", b"PNR3", b"PNR5", b"PNR0"
 
@@ -120,9 +121,7 @@ def frame(magic, page, data=b"", meta=b""):
 def find_port(explicit=None):
     if explicit:
         return explicit
-    # macOS exposes the CDC interface as /dev/cu.usbmodem*, Linux as
-    # /dev/ttyACM*. Same protocol either way.
-    c = sorted(glob.glob("/dev/cu.usbmodem*") + glob.glob("/dev/ttyACM*"))
+    c = sorted(glob.glob("/dev/cu.usbmodem*"))
     return c[0] if c else None
 
 
@@ -173,7 +172,7 @@ def write_page(p, page, data, meta, delay=0.0015):
 
 
 def payload_pages(prefix, blob):
-    """16-byte header + payload, padded to a page boundary."""
+    """16 字节头 + 数据，按页对齐"""
     head = prefix + struct.pack("<I", len(blob)) + b"\x00" * 8
     raw = head + blob
     if len(raw) % PAGE:
@@ -201,14 +200,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-p", "--port")
     ap.add_argument("--images", nargs=3, metavar=("MENU_SB", "HP_BIN", "NUTTX_BIN"))
+    ap.add_argument("--khicas", metavar="BLOB",
+                    help="把 KhiCAS 分页代码镜像 (khicas.bin) 写到块 800（裸数据，无头）")
     ap.add_argument("--nx-header", action="store_true",
-                    help="prefix the NuttX image with the NXB1 header (needed "
-                         "when the menu loads it; pass '-' to skip a slot)")
+                    help="NuttX 段加上 NXB1 头（菜单自己加载时用）")
     ap.add_argument("--only", choices=("menu", "hp", "nuttx"), default=None,
-                    help="write only one of the three areas")
-    ap.add_argument("--delay", type=float, default=0.0015,
-                    help="pause between CDC chunks, in seconds (0.003 is the "
-                         "slowest value known to be reliable)")
+                    help="只写其中一项（配合 --images）")
+    ap.add_argument("--delay", type=float, default=0.0015, help="CDC 分块间隔秒")
     ap.add_argument("--ldlb", action="store_true")
     ap.add_argument("--restore-ldlb", action="store_true")
     ap.add_argument("--show", action="store_true")
@@ -218,7 +216,7 @@ def main():
 
     path = find_port(args.port)
     if not path:
-        raise SystemExit("no CDC port found -- load the nandrestore firmware first")
+        raise SystemExit("no /dev/cu.usbmodem* — 先载入 nandrestore 固件")
 
     have_backup = os.path.exists(args.backup_data) and os.path.exists(args.backup_oob)
 
@@ -232,6 +230,20 @@ def main():
         return d, m
 
     p = connect(path)
+
+    if args.khicas:
+        blob = open(args.khicas, "rb").read()
+        maxlen = KHICAS_BLOCKS * PPB * PAGE
+        if len(blob) > maxlen:
+            raise SystemExit("khicas.bin is %d bytes, region holds %d"
+                             % (len(blob), maxlen))
+        if len(blob) % PAGE:
+            blob += b"\xff" * (PAGE - len(blob) % PAGE)
+        pages = [blob[i:i + PAGE] for i in range(0, len(blob), PAGE)]
+        write_area(p, KHICAS_FIRST_BLOCK, pages, "khicas", args.delay)
+        p.write(MAGIC_E)
+        p.close()
+        return
 
     if args.show:
         for b in LDLB_BLOCKS:
@@ -249,26 +261,23 @@ def main():
         return
 
     if args.images and not (args.ldlb or args.restore_ldlb):
-        menu_sb, hp_bin, nx_bin = (None if x == "-" else open(x, "rb").read()
-                                   for x in args.images)
-        menu_pages = payload_pages(b"", menu_sb)          # the menu is the stream itself
-        hp_pages = payload_pages(b"HPB1", hp_bin) if hp_bin is not None else None
-        # The NuttX segment is read by the menu, not by the boot ROM, so the
-        # NXB1 header goes in front of the raw binary. Without --nx-header the
-        # image is written verbatim, which is what the boot ROM would want if
-        # it were pointed at this block directly.
+        menu_sb, hp_bin, nx_bin = (open(x, "rb").read() for x in args.images)
+        menu_pages = payload_pages(b"", menu_sb)          # 菜单本身就是 SB 流，不加头
+        hp_pages = payload_pages(b"HPB1", hp_bin)
+        # NuttX 这一段是给 ROM 直接执行的 SB 流，不能加头（加头会让
+        # ROM 把 "NXB1" 当 SB 签名而放弃启动）
         if args.nx_header:
             nx_pages = payload_pages(b"NXB1", nx_bin)
         else:
             nx_pages = [nx_bin[i:i + PAGE].ljust(PAGE, b"\xff")
                         for i in range(0, len(nx_bin), PAGE)]
 
-        # The first page of the menu stream is the sb1 header; write it verbatim.
+        # 菜单 SB 的第一页就是流头，原样写
         if args.only in (None, "menu"):
             write_area(p, MENU_BLOCK, [menu_sb[i:i + PAGE].ljust(PAGE, b"\xff")
                                        for i in range(0, len(menu_sb), PAGE)],
                        "menu", args.delay)
-        if args.only in (None, "hp") and hp_pages is not None:
+        if args.only in (None, "hp"):
             write_area(p, HP_BLOCK, hp_pages, "hp script", args.delay)
         if args.only in (None, "nuttx"):
             write_area(p, NX_BLOCK, nx_pages, "nuttx image", args.delay)
@@ -294,8 +303,7 @@ def main():
     if args.ldlb:
         if not have_backup:
             raise SystemExit("need backup to preserve LDLB2 page")
-        # Take the menu size from the stream header already in NAND;
-        # image_size there is counted in 16-byte blocks.
+        # 菜单页数直接从 NAND 上菜单 SB 的头部算（image_size 以 16 字节块计）
         hdr, _ = read_page(p, MENU_BLOCK * PPB)
         if hdr[20:24] != b"STMP":
             raise SystemExit("menu image not found at page %d" % (MENU_BLOCK * PPB))
@@ -305,7 +313,7 @@ def main():
               % (img_blocks * 16, menu_pages))
 
         for b in LDLB_BLOCKS:
-            d0, m0 = read_page(p, b * PPB)   # current LDLB, maybe already ours
+            d0, m0 = read_page(p, b * PPB)          # 当前 LDLB（可能已经是菜单版）
             base = d0
             if have_backup and not (base[44:48] == b"LDLB"):
                 base = bk_page(b * PPB)[0]
@@ -314,8 +322,7 @@ def main():
             struct.pack_into("<I", new, 60, menu_pages)
             struct.pack_into("<I", new, 68, MENU_BLOCK * PPB)
             struct.pack_into("<I", new, 76, menu_pages)
-            # Rewrite the whole block: page0 is the new LDLB, page1 the
-            # preserved LDLB2, every other page was 0xff and stays 0xff.
+            # 擦写整块：page0 = 新 LDLB，page1 = 原 LDLB2，其余页原本是全 ff
             o1, o2 = bk_page(b * PPB + 1)
             if not have_backup:
                 o1, o2 = read_page(p, b * PPB + 1)

@@ -63,19 +63,28 @@ the stock system.
 ```bash
 python3 host-tools/install_menu.py \
         --images dist/bootmenu.sb - dist/nuttx.bin \
-        --nx-header --delay 0.003
+        --nx-header --khicas dist/khicas.bin --delay 0.003
 ```
 
 What that does, in order: erase block 240 and write the 42-page menu stream,
-skip the HP slot (the `-`), erase blocks 243/244 and write `NXB1` + `nuttx.bin`,
-then read every page back and compare. Expected output ends with
+skip the HP slot (the `-`), erase blocks 243..246 and write `NXB1` + `nuttx.bin`,
+erase blocks 800..1023 and write the KhiCAS engine raw, then read every page
+back and compare. Expected output ends with
 
 ```
 menu: 42 pages -> blocks 240..240
   menu written + verified
-nuttx image: 92 pages -> blocks 243..244
+nuttx image: 135 pages -> blocks 243..245
   nuttx image written + verified
+khicas: 1562 pages -> blocks 800..824
+  khicas written + verified
 ```
+
+`--khicas` is optional. Without it NuttX still boots; `khicas` then reports
+that the engine is missing. On the first boot NuttX copies those blocks to
+`/mnt/khicas.bin` (the panel shows `installing khicas...` for a few seconds);
+after that the pager reads the engine out of the raw blocks, re-staging them
+from the file whenever the file changes.
 
 If you get `E crc` instead, the CDC pacing was too fast: raise `--delay` to
 `0.005` and retry. Nothing is left half-written — the verify step fails before
@@ -204,7 +213,7 @@ directly, which this layout does not do.)
 **Battery in while flashing.** Works, but the device can power down mid-write. Use
 USB power with the battery out, which is also how you get into the boot ROM.
 
-**Assuming the menu is the first thing at 0.** It is linked for `0x30000` and the
+**Assuming the menu is the first thing at 0.** It is linked for `0x50000` and the
 boot ROM is told to load it there. A `nuttx.bd`-style stream (load at 0) will
 crash immediately.
 

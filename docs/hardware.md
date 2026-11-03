@@ -57,7 +57,7 @@ Runtime map with the boot menu installed **[M]**:
 |---|---|
 | `0x00000`–`0x2F80D` | stock loader `LOAD` targets (only used by the disabled HP OS path) |
 | `0x00000`–… | NuttX: `.vectors` must be the first thing at 0, then text/data/bss |
-| `0x30000`–`~0x48000` | the boot menu itself (linked at `0x30000`, see `Script/ldr_ld_30000.script`) |
+| `0x50000`–`~0x69000` | the boot menu itself (linked at `0x50000`, see `Script/ldr_ld_50000.script`) |
 | `0x67F00` and below | safe stack for anything that runs the stock boot stream |
 | `0x68000`–`0x78300` | second half of the stock boot stream (reached as `0xE8000`) |
 | `0x7C000`–`0x80000` | NuttX first-level page table (`PGTABLE_SIZE`, 16 KB) |

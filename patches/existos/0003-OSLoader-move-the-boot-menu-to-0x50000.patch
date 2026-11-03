@@ -1,0 +1,150 @@
+From d56a2d285db78d7e298c99c9ed6307c41c860aed Mon Sep 17 00:00:00 2001
+From: edwardzhu02 <explodingtnt@foxmail.com>
+Date: Tue, 3 Nov 2026 15:07:28 +0800
+Subject: [PATCH] OSLoader: move the boot menu to 0x50000
+
+The menu is loaded at 0x30000 and copies the NuttX image to 0x0.  That
+worked while NuttX was under 192 KB, but the KhiCAS build is 267 KB, so the
+copy would run straight through the menu code that is doing the copying.
+
+Move the menu to 0x50000 (64 KB aligned, so the ELF load segment does not
+get rounded down) and raise the image guard to 0x4f000.  SRAM is 512 KB:
+the menu image plus bss ends around 0x69000 and the heap runs up to the
+0x7EDFC stack area, which is still ~58 KB of headroom.
+
+start.c had the menu base hardcoded twice: it copies the exception vectors
+from 0x30000 to 0x0.  Use a __image_start symbol from the linker script
+instead, so changing the load address only changes the linker script.
+---
+ OSLoader/CMakeLists.txt                             |  2 +-
+ OSLoader/bootmenu.c                                 |  8 ++++----
+ OSLoader/start.c                                    | 10 ++++++----
+ Script/build_menu.bd                                |  4 ++--
+ Script/ldr_ld.script                                |  3 ++-
+ Script/{ldr_ld_30000.script => ldr_ld_50000.script} |  5 +++--
+ 6 files changed, 18 insertions(+), 14 deletions(-)
+ rename Script/{ldr_ld_30000.script => ldr_ld_50000.script} (86%)
+
+diff --git a/OSLoader/CMakeLists.txt b/OSLoader/CMakeLists.txt
+index 040dda1..faf6d9f 100644
+--- a/OSLoader/CMakeLists.txt
++++ b/OSLoader/CMakeLists.txt
+@@ -40,7 +40,7 @@ endif()
+ 
+ 
+ if(DEFINED ENV{BOOTMENU})
+-  set(MENU_LD_SCRIPT ${CMAKE_SOURCE_DIR}/Script/ldr_ld_30000.script)
++  set(MENU_LD_SCRIPT ${CMAKE_SOURCE_DIR}/Script/ldr_ld_50000.script)
+   set(MENU_BD ${CMAKE_SOURCE_DIR}/Script/build_menu.bd)
+ else()
+   set(MENU_LD_SCRIPT ${CMAKE_SOURCE_DIR}/Script/ldr_ld.script)
+diff --git a/OSLoader/bootmenu.c b/OSLoader/bootmenu.c
+index 2709fe6..e0d625f 100644
+--- a/OSLoader/bootmenu.c
++++ b/OSLoader/bootmenu.c
+@@ -1,7 +1,7 @@
+ /*
+  * HP 39gII (STMP3770) 双启动菜单
+  *
+- * 由 BootROM 通过 LDLB 载入到 0x30000 执行（见 Script/build_menu.bd）。
++ * 由 BootROM 通过 LDLB 载入到 0x50000 执行（见 Script/build_menu.bd）。
+  * 菜单只读 NAND，不改任何 flash 内容；两个选项：
+  *
+  *   HP OS  —— 执行原厂引导流（由主机工具离线解密后放在 241 号块，
+@@ -11,7 +11,7 @@
+  *
+  * 内存布局（512 KB SRAM，地址只译 19 位）：
+  *   0x00000..0x2F80D  原厂引导段的 LOAD 目标
+- *   0x30000..~0x48000 本菜单（不会被两边的 LOAD 覆盖）
++ *   0x50000..~0x69000 本菜单（不会被 NuttX 的 LOAD 覆盖）
+  *   0x68000..0x78300  原厂引导段后半段的 LOAD 目标（0xE8000 别名）
+  * 所以真正跑引导流之前要把栈切到 0x67F00 以下的安全区。
+  */
+@@ -675,9 +675,9 @@ static void boot_nuttx(void)
+ 
+     size = rd32(hdr + 4);
+ 
+-    /* 尺寸护栏：镜像必须能整段放进 0x0..0x30000（菜单自己住在 0x30000，
++    /* 尺寸护栏：镜像必须能整段放进 0x0..0x50000（菜单自己住在 0x50000，
+      * NuttX 的页表在 0x7C000）。头损坏时宁可报错，也不要把菜单自己冲掉。 */
+-    if (size < sizeof(uint32_t) * 16u || size > 0x0002f000u) {
++    if (size < sizeof(uint32_t) * 16u || size > 0x0004f000u) {
+         draw_menu(1, (char *)"nuttx: bad size");
+         for (;;)
+             vTaskDelay(pdMS_TO_TICKS(1000));
+diff --git a/OSLoader/start.c b/OSLoader/start.c
+index 57fc470..aceaac8 100644
+--- a/OSLoader/start.c
++++ b/OSLoader/start.c
+@@ -1054,14 +1054,16 @@ volatile void _startup() {
+     g_rom_pwr[9] = HW_POWER_BATTMONITOR_RD();
+ #endif /* BOOTMENU_HP */
+ 
+-    /* 菜单固件链接在 0x30000，但 ARM926 的异常向量固定在 0x0：
+-     * 这里（栈已就绪）先把镜像开头的 8 条向量指令拷到 0x0。
+-     * 原厂引导流之后会覆盖 0x0，那时我们已经不再依赖异常。 */
++    /* ARM926 的异常向量固定在 0x0，而菜单固件链接在别处（链接脚本把
++     * 镜像基址放在 __image_start）：这里（栈已就绪）先把镜像开头的 8 条
++     * 向量指令拷到 0x0。原厂引导流之后会覆盖 0x0，那时我们已经不再依赖
++     * 异常。基址来自链接脚本，换加载地址不用再改这里。 */
+     {
+         /* 必须连字面量池一起拷：前 8 条是 ldr pc,.Lxxx，它们指向的字面量
+          * 在偏移 32..63。只拷 8 个字的话，跳到 0x0 的那几条 ldr 会去
+          * 0x20..0x3C 读垃圾，第一次中断就飞。 */
+-        volatile uint32_t *src = (volatile uint32_t *)0x00030000;
++        extern uint32_t __image_start[];
++        volatile uint32_t *src = (volatile uint32_t *)__image_start;
+         volatile uint32_t *dst = (volatile uint32_t *)0x00000000;
+         for (int i = 0; i < 16; i++)
+             dst[i] = src[i];
+diff --git a/Script/build_menu.bd b/Script/build_menu.bd
+index cbbc766..d9c786f 100644
+--- a/Script/build_menu.bd
++++ b/Script/build_menu.bd
+@@ -19,6 +19,6 @@ inputFile = extern(0);
+ }
+ 
+ section (0) {
+-	load inputFile > 0x00030000;
+-	jump 0x00030000;
++	load inputFile > 0x00050000;
++	jump 0x00050000;
+ }
+diff --git a/Script/ldr_ld.script b/Script/ldr_ld.script
+index 34c1102..2894403 100644
+--- a/Script/ldr_ld.script
++++ b/Script/ldr_ld.script
+@@ -5,7 +5,8 @@ ENTRY(_init)
+ SECTIONS
+ {
+ 	.init.text : AT(0x0000) 
+-	{ 
++	{
++		__image_start = .; 
+ 		*(.init)
+ 	}
+ 	.init.data :
+diff --git a/Script/ldr_ld_30000.script b/Script/ldr_ld_50000.script
+similarity index 86%
+rename from Script/ldr_ld_30000.script
+rename to Script/ldr_ld_50000.script
+index ae927ce..70879ba 100644
+--- a/Script/ldr_ld_30000.script
++++ b/Script/ldr_ld_50000.script
+@@ -4,10 +4,11 @@ ENTRY(_init)
+ 
+ SECTIONS
+ {
+-	. = 0x00030000;
++	. = 0x00050000;
+ 
+-	.init.text : AT(0x00030000)
++	.init.text : AT(0x00050000)
+ 	{
++		__image_start = .;
+ 		*(.init)
+ 	}
+ 	.init.data :
+-- 
+2.53.0
+

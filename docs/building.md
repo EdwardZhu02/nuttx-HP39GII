@@ -88,12 +88,13 @@ Expected sizes, so you can tell at a glance whether a build went wrong:
 
 | Artifact | Size |
 |---|---|
-| `nuttx.bin` | ≈ 186 KB (36 % of the 512 KB SRAM) |
-| `nuttx.sb` | ≈ 186 KB + 228 B of stream overhead |
+| `nuttx.bin` | ≈ 274 KB (53 % of the 512 KB SRAM) |
+| `khicas.bin` | ≈ 3.1 MB (the paged engine, when `CONFIG_STMP3770_KHICAS=y`) |
+| `nuttx.sb` | the resident image + 228 B of stream overhead |
 | `bootmenu.sb` | ≈ 84 KB (42 pages) |
 | `nandrestore.sb`, `nanddump*.sb`, `probe.sb` | ≈ 84–90 KB (one page count each) |
 
-The build also stops if `nuttx.bin` would overlap the page table at `0x7C000`.
+The build also stops if `nuttx.bin` would not fit below the boot menu at `0x50000`.
 
 The `.sb` files are **not** bit-reproducible: `elftosb -z` emits a 16-byte key
 block whose contents vary per run, so two builds of the same sources produce

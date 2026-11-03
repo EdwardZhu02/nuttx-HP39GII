@@ -27,7 +27,7 @@ to.
                     ┌───────────────┴───────────────┐
                     │                               │
         stock: page 1408 (block 22)      ours: block 240
-        OSLoader.sb → 0x0                menu sb → 0x30000
+        OSLoader.sb → 0x0                menu sb → 0x50000
                     │                               │
                     ▼                               ▼
         OSLoader builds the VM,          boot menu, reads NAND,
@@ -97,8 +97,9 @@ The menu does the following, in this order (the order matters, see below):
 ### Why the first 64 bytes are copied last
 
 The menu's own exception vectors live at `0x0` (its `_startup` copies 16 words from
-`0x30000`: eight `ldr pc` plus eight literals). GPMI reads are DMA and depend on
-interrupts. So while the 186 KB image is being moved into place, the tick interrupt at
+the image base -- `__image_start` from the linker script, `0x50000`: eight `ldr pc`
+plus eight literals). GPMI reads are DMA and depend on interrupts. So while the
+274 KB image is being moved into place, the tick interrupt at
 1 ms keeps vectoring through `0x0`. As soon as the low part of `0x0` contains NuttX code
 and `g_irqvector` is still garbage, the machine takes an exception into an
 uninitialised table and resets back into the menu. Copying the vector block last, with

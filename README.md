@@ -13,7 +13,7 @@ Three things are built here:
 
 | Component | What it is | Where it runs |
 |---|---|---|
-| **NuttX port** | `arch/arm/src/stmp3770` + `boards/arm/stmp3770/hp39gii` — 22 patch commits on top of Apache NuttX | calculator (after the menu hands over) |
+| **NuttX port** | `arch/arm/src/stmp3770` + `boards/arm/stmp3770/hp39gii` — 26 patch commits on top of Apache NuttX | calculator (after the menu hands over) |
 | **Boot menu** | an OSLoader variant of [ExistOS](https://github.com/ExistOS-Team/ExistOS-For-HP39GII) that loads NuttX from NAND and offers the stock system as a (disabled) second entry | calculator, loaded by the boot ROM |
 | **Recovery firmware** | `nandrestore` / `nanddump` / `probe`: RAM-only firmware that talks to a host over USB CDC | calculator, loaded by the boot ROM over USB |
 
@@ -39,12 +39,13 @@ Verified on real hardware unless marked otherwise.
 | Boot menu, "HP OS" entry | ❌ disabled — the stock boot flow needs the mask ROM and high vectors; executing it from the menu ends in a black screen (see [docs/boot-chain.md](docs/boot-chain.md#why-hp-os-is-disabled)) |
 | USB device (CDC-ACM) under NuttX | ❌ not implemented |
 | LCD framebuffer / graphics beyond the 32×16 text console | ❌ not implemented |
-| On-demand paging (3.5 MB window over NAND) | ⚠️ works when enabled -- 888/888 paged calls pass -- but the LCD console stops updating, so it is off by default; see [docs/khicas.md](docs/khicas.md) |
-| KhiCAS (Giac/Xcas) | ⚠️ not started — 2.44 MB of code on a 512 KB machine, so it needs on-demand paging, and paging needs the MMU, which this port currently keeps off; see [docs/khicas.md](docs/khicas.md) |
+| On-demand paging (3.75 MB window over NAND) | ✅ works — 16 frames of 4 KB, filled from NAND inside the abort handler; see [docs/khicas.md](docs/khicas.md) |
+| KhiCAS (Giac/Xcas) | ✅ works in EmuGII — `khicas` starts the CAS console; 3.2 MB of Thumb code paged from `/mnt/khicas.bin`, `2+2` → `4`, `integrate(x^2,x)` → `x**3/3`. Not yet run on hardware; see [docs/khicas.md](docs/khicas.md) |
 | Linux on this device | ❌ impossible — 512 KB of RAM, see [docs/hardware.md](docs/hardware.md#there-is-no-dram) |
 
-NuttX uses about 186 KB of the 512 KB SRAM (36 %), so roughly 320 KB is left for the
-heap, the SmartFS cache and applications.
+NuttX uses about 274 KB of the 512 KB SRAM (53 %). Of the rest, 80 KB is the paged
+window's frames and the two page tables, and roughly 230 KB is left for the heap, the
+SmartFS cache, applications and their stacks.
 
 ## Quick start
 
@@ -95,7 +96,7 @@ python3 host-tools/split-nand.py --split nand-full.raw --out nand-full
 # 4. write the menu (block 240) and NuttX (block 243), then point the boot ROM
 #    at the menu -- two separate commands, on purpose
 python3 host-tools/install_menu.py --images dist/bootmenu.sb - dist/nuttx.bin \
-        --nx-header --delay 0.003
+        --nx-header --khicas dist/khicas.bin --delay 0.003
 python3 host-tools/install_menu.py --ldlb --backup-data nand-full.data \
         --backup-oob nand-full.oob
 ```
@@ -113,9 +114,9 @@ python3 host-tools/install_menu.py --restore-ldlb --backup-data nand-full.data \
 ## Repository layout
 
 ```
-patches/nuttx/     22 patches: the SoC port + board support, against a pinned NuttX
-patches/apps/       1 patch:   the nshlib "clear" command
-patches/existos/    2 patches: the NAND dump/restore firmware and the boot menu
+patches/nuttx/     26 patches: the SoC port + board support, against a pinned NuttX
+patches/apps/       2 patches: the nshlib "clear" and "khicas" commands
+patches/existos/    3 patches: the NAND dump/restore firmware and the boot menu
 scripts/            fetch, configure, build, package (see docs/building.md)
 host-tools/         host side of the USB protocols, and the macOS SDP loader
 docs/               hardware, boot chain, NAND layout, building, flashing, pitfalls

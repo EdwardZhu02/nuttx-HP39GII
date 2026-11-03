@@ -174,7 +174,7 @@ otherwise the semaphore is used uninitialised.
 **Selecting NuttX resets back into the menu.**
 Two independent causes, both fixed:
 
-1. the 186 KB image was copied to 0 including the vector block, while interrupts
+1. the image was copied to 0 including the vector block, while interrupts
    were still on. Every 1 ms tick vectoring through `0x0` landed in NuttX's
    not-yet-initialised table. Copy everything except the first 64 bytes, disable
    interrupts, then copy the vectors.

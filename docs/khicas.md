@@ -7,9 +7,10 @@ would have to be built for the same CAS to run under NuttX.
 
 Short version: **the CAS is not the hard part, the memory is.** KhiCAS is ~2.4 MB of
 ARM code on a machine with 512 KB of SRAM. ExistOS runs it behind a demand-paging VM
-whose backing store is NAND. NuttX has an in-tree pager of the same shape
-(`CONFIG_LEGACY_PAGING`), but this port does not use it yet, and enabling it is the
-real work item.
+whose backing store is NAND. This port does the same thing with a much smaller pager
+and no VM: the engine is linked into a window above physical RAM and filled 4 KB at a
+time from NAND, from inside the abort handler. Section 7.3 describes the finished
+article; sections 1-6 are the measurements that led there and are kept as the record.
 
 Measurements below are from the build artifacts in this repository's `.deps/existos`
 tree (`sys.elf`, `libcas.libcpp`) with `arm-none-eabi-nm/size`; the mechanism comes
@@ -327,25 +328,90 @@ this port has never survived the blocking model in `sched/paging` (see 7.0 below
 * The abort handlers therefore have to hand the context pointer back, so
   `arm_dataabort()` and `arm_prefetchabort()` return `uint32_t *` now.
 
-**Known issue: with paging enabled the LCD console stops updating.** The panel keeps
-showing the bring-up marker that was drawn before the MMU came on; `LCDIF` registers
-still read back sane (`0x00060000` at `0x8003_0000`), the console `puts` path runs to
-completion, and a direct `stmp3770_lcd_marker()` call after the MMU is up has no
-visible effect either. The same image with paging disabled draws NSH normally, and the
-only difference is that sections 0..3 are coarse tables instead of one section. So the
-paging configuration is left **off by default**; the default build boots NSH
-(pixel-identical to the MMU build) and the pager is one config switch away.
+**The console issue that used to be listed here is fixed.** It was not the mapping: the
+LCDIF feeds its write buffers to the APBH DMA engine, and APBH addresses memory
+*physically*. Every buffer the console handed it lived in the data region, whose virtual
+address has nothing to do with its physical one once the MMU is on, so the DMA wrote 3.7
+MB away from the framebuffer. `stmp3770_va2pa()` translates; the LCD, the GPMI and the MTD bounce buffers all call
+it now. It returns the address unchanged while the MMU is off (the LCD is brought up
+before `stmp3770_mmuinit()`), which matters because the table at `0x7C000` still holds
+whatever the boot menu's heap left there -- on hardware that reads back as plausible
+descriptors and sends the panel's init sequence into nowhere, i.e. a black screen after
+the menu. `arm_boot()` also clears the table before anything walks it. Paging is **on by
+default**.
 
-To reproduce the test on a scratch unit (it erases NAND blocks 5..32 on every boot):
+To reproduce the self-test on a scratch unit (it erases NAND blocks 5..32 on every boot):
 
 ```
 CONFIG_STMP3770_PAGING=y
 CONFIG_STMP3770_PAGETEST=y
 ```
 
-Next: find why the panel stops taking writes when the low 4 MB are page mapped -- the
-first thing to try is whether the LCDIF needs the framebuffer/line buffer in a section
-mapping, or whether the write path is timing dependent.
+### 7.3 KhiCAS, as implemented
+
+`khicas` in NSH starts the CAS console. `2+2` answers `4`, `integrate(x^2,x)` answers
+`x**3/3`, from a 3.2 MB engine on a 512 KB machine.
+
+**Memory map** (`stmp3770_memorymap.h`, only with `CONFIG_STMP3770_PAGING`):
+
+```
+physical                       virtual                       what
+0x00000 .. 0x6B000  identity   0x00000 .. 0x6B000  (1MB section)  image, heap, stacks
+0x6B000 .. 0x6C000  identity   --                             4 coarse L2 tables
+0x6C000 .. 0x7C000  identity   --                             16 frames of 4 KB
+0x7C000 .. 0x80000  identity   --                             L1 page table
+        --          0x400000 .. 0x7C0000                        3.75 MB window (960 pages)
+```
+
+The window is above physical RAM. That is the whole trick: nothing that has to stay
+resident -- image, heap, stacks, page tables -- is reachable through the window, so a
+buggy eviction cannot corrupt the kernel. It replaced an earlier layout where the window
+sat inside RAM and the page tables had to be pinned inside it.
+
+**The engine is a file.** `install_menu.py --khicas dist/khicas.bin` writes the 3.2 MB
+`.pgtext` blob to NAND blocks 800..1023. The first boot copies it to `/mnt/khicas.bin`
+and every boot compares the two, staging the file back into that raw area if it changed.
+The pager reads from the raw area only: a file system read from inside an abort handler
+works just often enough to be a trap (it corrupts the heap), and `NAND` reads there are
+two page reads instead of eight sector reads.
+
+**Three things had to be fixed before real code survived paging**, all in patch 0026:
+
+* The frame reverse map was never initialised. For the first 16 faults the frames are
+  free, so a forward sweep (the self-test) passes; real code revisits pages, and from
+  then on it executed whatever page had been handed the frame next.
+* GPMI completion latches. Filling a page runs with interrupts masked, so the three GPMI
+  ISRs never run, and their sticky latches (`APBH CH4 CMDCMPLT`, `ECC8 COMPLETE`) block
+  the *next* chain: it consumes the semaphore, times out and silently returns the
+  previous page. Symptom: every second 2 KB read identical to the one before it, i.e. a
+  4 KB page whose halves match. `GPMI_PolledComplete()` clears the latches after a
+  polled wait.
+* The page self-test had to switch to Thumb stubs: the engine is Thumb code, and the
+  paged path had only ever been proven for ARM.
+
+**The resident half** is `khicas_app.cpp` (HAL, REPL, constructor runner), `khicas_stubs.cpp`
+(the ~50 platform symbols giac needs: turtle, catalog, Xcas UI) and `khicas_compat.c`
+(newlib bits the prebuilt archives expect). `scripts/build-khicas.sh` builds it with the
+toolchain headers rather than NuttX's, because the prebuilt libstdc++ objects are newlib
+ABI, and runs the `.init_array` constructors itself -- `CONFIG_HAVE_CXXINITIALIZE` would
+pull in the NuttX C++ runtime, which is not that ABI.
+
+**Build and install**:
+
+```
+./scripts/build-nuttx.sh            # dist/nuttx.bin (274 KB) + dist/khicas.bin (3.2 MB)
+python3 host-tools/install_menu.py --images dist/bootmenu.sb - dist/nuttx.bin \
+        --nx-header --khicas dist/khicas.bin
+```
+
+Then on the calculator: `cd /mnt` shows `khicas.bin`, and `khicas` runs it.
+
+![KhiCAS running in EmuGII](khicas-emugii.png)
+
+**Verified in EmuGII**, through the real boot chain (menu firmware at `0x50000` ->
+NuttX from NAND block 243 -> auto-format SmartFS -> install the engine -> `khicas`).
+Not yet run on hardware: the 39gII has no exposed console, so the first real-hardware
+sign of life is `khicas` printing `CAS> ` on the panel.
 
 ## 8. What is reusable from ExistOS, verbatim
 

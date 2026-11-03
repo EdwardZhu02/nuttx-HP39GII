@@ -92,13 +92,30 @@ else
   note "reusing existing .config"
 fi
 
+# The KhiCAS application has a resident half that is not part of the kernel
+# build: it is compiled against the toolchain headers (newlib ABI) because
+# that is what the prebuilt giac archives use.  See scripts/build-khicas.sh.
+if grep -q '^CONFIG_STMP3770_KHICAS=y' .config; then
+  "$ROOT/scripts/build-khicas.sh"
+fi
+
 step "make -j$JOBS"
 make -j"$JOBS"
 
-[ -f nuttx.bin ] || die "nuttx.bin was not produced"
+[ -f nuttx ] || die "nuttx was not produced"
 
 mkdir -p "$DIST_DIR"
-cp nuttx.bin "$DIST_DIR/nuttx.bin"
+
+# With KhiCAS the ELF carries the engine in .pgtext, linked into the paged
+# window at 0x400000.  That section is not part of the resident image: the
+# loader maps one 4 KB page of it at a time out of dist/khicas.bin, which
+# install_menu.py writes to NAND.  The resident image is everything else.
+if grep -q '^CONFIG_STMP3770_KHICAS=y' .config; then
+  "${CROSS_COMPILE}objcopy" -O binary -R .pgtext nuttx "$DIST_DIR/nuttx.bin"
+  "${CROSS_COMPILE}objcopy" -O binary -j .pgtext nuttx "$DIST_DIR/khicas.bin"
+else
+  "${CROSS_COMPILE}objcopy" -O binary nuttx "$DIST_DIR/nuttx.bin"
+fi
 
 [ -x "$ELFTOSB" ] || die "elftosb not built -- run scripts/build-sbtools.sh first"
 
@@ -110,12 +127,15 @@ python3 "$ROOT/scripts/verify-sb.py" "$DIST_DIR/nuttx.sb" \
   || die "dist/nuttx.sb is not a valid sb1 BootStream"
 
 describe "$DIST_DIR/nuttx.bin"
+if [ -f "$DIST_DIR/khicas.bin" ]; then
+  describe "$DIST_DIR/khicas.bin"
+fi
 describe "$DIST_DIR/nuttx.sb"
 
-# The image must fit next to the page table and leave a heap. 512 KB SRAM, 16 KB
-# of it reserved for the first-level page table at 0x7C000.
+# The menu copies this image to 0x0 while it runs from 0x50000, so the image
+# has to end below the menu (the menu refuses anything over 0x4F000 itself).
 SIZE=$(wc -c <"$DIST_DIR/nuttx.bin" | tr -d ' ')
-if [ "$SIZE" -gt $((512 * 1024 - 0x4000)) ]; then
-  die "nuttx.bin is $SIZE bytes, which does not fit below the page table"
+if [ "$SIZE" -gt $((0x4f000)) ]; then
+  die "nuttx.bin is $SIZE bytes; the boot menu at 0x50000 can only load 0x4f000"
 fi
 note "nuttx.bin uses $((SIZE * 100 / (512 * 1024)))% of the 512 KB SRAM"

@@ -1,0 +1,1519 @@
+From 72f277a85af5d71f03c5682c5bdec0101ff5f8b3 Mon Sep 17 00:00:00 2001
+From: edwardzhu02 <explodingtnt@foxmail.com>
+Date: Tue, 3 Nov 2026 15:06:47 +0800
+Subject: [PATCH] hp39gii: run KhiCAS (giac) out of the paged window
+
+The calculator has 512 KB of SRAM and the giac engine is 3.2 MB of Thumb
+code, so it cannot be linked in.  It is linked into a .pgtext section at
+0x00400000 instead, demand-paged one 4 KB page at a time from NAND, and
+started from the NSH command "khicas".
+
+Paging layout: the first megabyte stays one identity section (image, heap,
+stacks, page tables), and the window is a separate 3.75 MB virtual range
+that sits above physical RAM - so nothing that must stay resident can be
+evicted by accident.  The window is mapped through four coarse tables at
+0x6B000 and backed by 16 frames at 0x6C000.
+
+The pager itself was already in the tree; three things had to change for
+real code to survive it:
+
+  - The reverse map (which page a frame holds) is now initialised.  Without
+    it the first 16 faults were fine and everything after that executed a
+    page that had been handed to someone else.
+  - GPMI: when a page is filled from an abort handler, interrupts are
+    masked, so none of the three GPMI ISRs run.  Their sticky completion
+    latches (APBH CH4 CMDCMPLT, ECC8 COMPLETE) then block the *next* chain:
+    it consumes the semaphore, times out, and silently hands back the
+    previous page.  GPMI_PolledComplete() clears them after a polled wait.
+    Symptom was "every second 2 KB read returns the previous page", i.e. a
+    page whose two halves were identical.
+  - hp39gii_pagetest: Thumb stubs, because the engine is Thumb code.
+
+The resident half of the application (khicas_app.cpp, khicas_stubs.cpp,
+khicas_compat.c) is built into libkhicas.a by scripts/build-khicas.sh: it is
+compiled against the toolchains newlib headers rather than NuttXs, which
+is the ABI the prebuilt giac archives were built for, and it runs the C++
+static constructors itself (CONFIG_HAVE_CXXINITIALIZE would drag in the
+NuttX C++ runtime, which is not that ABI).
+
+The engine ships as a file, /mnt/khicas.bin, so it is data and not part of
+the kernel image.  The pager cannot read through the file system from an
+abort handler, so boot copies the file into a raw staging area at NAND
+blocks 800.. when the two differ (nand_install_khicas()).
+
+Also here: the file system partition moves from block 245 to 247 - the
+NuttX image grew past two blocks - and CONFIG_STMP3770_KHICAS in Kconfig,
+on in the board defconfig.
+---
+ arch/arm/src/stmp3770/Kconfig                 |   9 +
+ arch/arm/src/stmp3770/Make.defs               |  18 +
+ arch/arm/src/stmp3770/stmp3770_allocateheap.c |   9 +-
+ arch/arm/src/stmp3770/stmp3770_boot.c         |  44 +-
+ arch/arm/src/stmp3770/stmp3770_gpmi.c         |  33 ++
+ arch/arm/src/stmp3770/stmp3770_memorymap.h    |  51 ++-
+ arch/arm/src/stmp3770/stmp3770_pager.c        |  51 ++-
+ .../stmp3770/hp39gii/configs/nsh/defconfig    |   2 +
+ boards/arm/stmp3770/hp39gii/scripts/ld.script |  22 +
+ .../arm/stmp3770/hp39gii/src/hp39gii_boot.c   | 249 +++++++++++-
+ .../stmp3770/hp39gii/src/hp39gii_pagetest.c   |  28 +-
+ .../hp39gii/src/khicas/khicas_app.cpp         | 383 ++++++++++++++++++
+ .../hp39gii/src/khicas/khicas_compat.c        | 104 +++++
+ .../hp39gii/src/khicas/khicas_stubs.cpp       | 181 +++++++++
+ 14 files changed, 1095 insertions(+), 89 deletions(-)
+ create mode 100644 boards/arm/stmp3770/hp39gii/src/khicas/khicas_app.cpp
+ create mode 100644 boards/arm/stmp3770/hp39gii/src/khicas/khicas_compat.c
+ create mode 100644 boards/arm/stmp3770/hp39gii/src/khicas/khicas_stubs.cpp
+
+diff --git a/arch/arm/src/stmp3770/Kconfig b/arch/arm/src/stmp3770/Kconfig
+index 5929d9b3..2e575a83 100644
+--- a/arch/arm/src/stmp3770/Kconfig
++++ b/arch/arm/src/stmp3770/Kconfig
+@@ -89,6 +89,15 @@ config STMP3770_PAGETEST
+ 		boot, which is fine on a scratch unit and destructive on a stock one
+ 		-- keep a nanddump first.
+ 
++config STMP3770_KHICAS
++	bool "KhiCAS (giac) as a paged app"
++	default n
++	depends on STMP3770_PAGING && STMP3770_NAND && STMP3770_LCD
++	---help---
++		Link the giac engine into the paged window and start it from the NSH
++		command "khicas".  The engine's text is demand-paged from a blob at
++		NAND blocks 800.. and the ~3 MB it needs never has to be resident.
++
+ config STMP3770_KBD
+ 	bool "Keyboard matrix"
+ 	default n
+diff --git a/arch/arm/src/stmp3770/Make.defs b/arch/arm/src/stmp3770/Make.defs
+index 6b744754..9e90dae1 100644
+--- a/arch/arm/src/stmp3770/Make.defs
++++ b/arch/arm/src/stmp3770/Make.defs
+@@ -37,3 +37,21 @@ endif
+ ifeq ($(CONFIG_STMP3770_NAND),y)
+ CHIP_CSRCS += stmp3770_gpmi.c stmp3770_mtd.c
+ endif
++
++ifeq ($(CONFIG_STMP3770_KHICAS),y)
++# The KhiCAS app: resident half from libkhicas.a, giac engine from the
++# prebuilt ExistOS archives (its .text lands in .pgtext, see ld.script).
++KHICAS_TOP ?= $(TOPDIR)/../existos
++EXTRA_LIBS += $(TOPDIR)/arch/arm/src/board/khicas/libkhicas.a
++# Use -l: so the archives appear to the linker by their plain names; the
++# linker script matches them as "libcas.libcpp:*(...)".
++EXTRA_LIBS += -L$(KHICAS_TOP)/Libs -l:libcas.libcpp -l:libtommath.libcpp
++# The C++ runtime: absolute paths, because NuttX links with $(LD) directly
++# and there are no default library search paths.  The top-level arm-none-eabi
++# libstdc++ is the ARMv4T/Thumb-1 build, which is safe on this core (the
++# arm/v5te/softfp multilib would emit VFP instructions).
++KHICAS_CXXLIBS = $(shell $(CROSSDEV)gcc -mcpu=arm926ej-s -mfloat-abi=soft -marm -print-file-name=libstdc++.a) \
++                 $(shell $(CROSSDEV)gcc -mcpu=arm926ej-s -mfloat-abi=soft -marm -print-file-name=libsupc++.a) \
++                 $(shell $(CROSSDEV)gcc -mcpu=arm926ej-s -mfloat-abi=soft -marm -print-file-name=libgcc.a)
++EXTRA_LIBS += $(KHICAS_CXXLIBS)
++endif
+diff --git a/arch/arm/src/stmp3770/stmp3770_allocateheap.c b/arch/arm/src/stmp3770/stmp3770_allocateheap.c
+index e15d5508..b78a06d6 100644
+--- a/arch/arm/src/stmp3770/stmp3770_allocateheap.c
++++ b/arch/arm/src/stmp3770/stmp3770_allocateheap.c
+@@ -30,15 +30,12 @@ void up_allocate_heap(void **heap_start, size_t *heap_size)
+ {
+   board_autoled_on(LED_HEAPALLOCATE);
+ 
+-#ifdef CONFIG_STMP3770_PAGING
+-  /* 分页布局下堆是独立的数据区（虚拟地址与物理地址不同） */
++  /* 分页布局下堆仍然是 identity 的：只有窗口 VA 被重映射，
++   * 帧和页表都在 0x6B000 以上。
++   */
+ 
+-  *heap_start = (void *)(uintptr_t)STMP3770_DATA_VBASE;
+-  *heap_size  = (size_t)(STMP3770_DATA_NPAGES * 4096);
+-#else
+   *heap_start = (void *)(uintptr_t)g_idle_topstack;
+   *heap_size  = (size_t)(STMP3770_HEAP_VEND - (uintptr_t)g_idle_topstack);
+-#endif
+ 
+   DEBUGASSERT(*heap_size > 0);
+ }
+diff --git a/arch/arm/src/stmp3770/stmp3770_boot.c b/arch/arm/src/stmp3770/stmp3770_boot.c
+index 7c99aa8a..b5f723d4 100644
+--- a/arch/arm/src/stmp3770/stmp3770_boot.c
++++ b/arch/arm/src/stmp3770/stmp3770_boot.c
+@@ -72,46 +72,24 @@
+ static void stmp3770_map_paged(void)
+ {
+   uint32_t  l1flags = PMD_TYPE_COARSE | PMD_BIT4;
+-  uint32_t  l2flags = PTE_TYPE_SMALL | PTE_SMALL_AP_UNO_SRW |
+-                      PTE_CACHEABLE | PTE_BUFFERABLE;
+   uint32_t *l1 = (uint32_t *)PGTABLE_BASE_VADDR;
+-  uint32_t *l2 = (uint32_t *)PGTABLE_L2_COARSE_PBASE;
++  uint32_t *l2 = (uint32_t *)STMP3770_L2_PBASE;
+   uint32_t  i;
+ 
++  /* L2 tables for the four sections the window lives in.  They start out
++   * invalid: the first access to a page takes a translation fault that
++   * stmp3770_pagefault() fills from NAND.
++   */
++
+   for (i = 0; i < 4 * 256; i++)
+     {
+       l2[i] = 0;
+     }
+ 
+-  /* Locked region: image, bss, idle stacks */
+-
+-  for (i = 0; i < STMP3770_LOCKED_NPAGES; i++)
+-    {
+-      l2[i] = (i << 12) | l2flags;
+-    }
+-
+-  /* Page tables: pinned where they are */
+-
+-  for (i = 0; i < 8; i++)
+-    {
+-      uint32_t va = STMP3770_PGTABLE_VBASE + i * 4096;
+-
+-      l2[(va & 0x000fffff) >> 12] = va | l2flags;
+-    }
+-
+-  /* Data region: virtual STMP3770_DATA_VBASE -> physical STMP3770_DATA_PBASE */
+-
+-  for (i = 0; i < STMP3770_DATA_NPAGES; i++)
+-    {
+-      uint32_t va = STMP3770_DATA_VBASE + i * 4096;
+-
+-      l2[((va >> 20) * 256) + ((va & 0x000fffff) >> 12)] =
+-          (STMP3770_DATA_PBASE + i * 4096) | l2flags;
+-    }
+-
+   for (i = 0; i < 4; i++)
+     {
+-      l1[i] = (PGTABLE_L2_COARSE_PBASE + i * 1024) | l1flags;
++      l1[(STMP3770_PAGED_VBASE >> 20) + i] =
++          (STMP3770_L2_PBASE + i * 1024) | l1flags;
+     }
+ }
+ 
+@@ -153,11 +131,11 @@ static void stmp3770_mmuinit(void)
+       l1[i] = 0;
+     }
+ 
+-#ifdef CONFIG_STMP3770_PAGING
+-  stmp3770_map_paged();
+-#else
+   l1[STMP3770_SRAM_BASE >> 20] =
+       (STMP3770_SRAM_BASE & 0xfff00000) | MMU_MEMFLAGS;
++
++#ifdef CONFIG_STMP3770_PAGING
++  stmp3770_map_paged();
+ #endif
+   l1[STMP3770_REGS_BASE >> 20] =
+       (STMP3770_REGS_BASE & 0xfff00000) | MMU_IOFLAGS;
+diff --git a/arch/arm/src/stmp3770/stmp3770_gpmi.c b/arch/arm/src/stmp3770/stmp3770_gpmi.c
+index 89c7e413..a624dca3 100644
+--- a/arch/arm/src/stmp3770/stmp3770_gpmi.c
++++ b/arch/arm/src/stmp3770/stmp3770_gpmi.c
+@@ -1100,6 +1100,36 @@ static inline void    GPMI_sendCommand(uint32_t *cmd, uint32_t *para, uint16_t p
+ 
+ }
+ 
++/* Polled completion.
++ *
++ * The pager fills pages from the abort handler, which runs with interrupts
++ * masked, so none of the three GPMI ISRs ever get to run.  The completion
++ * latches they normally clear (APBH CH4 CMDCMPLT, ECC8 COMPLETE) are sticky:
++ * leave them set and the next chain never starts -- it just consumes the
++ * semaphore and times out, handing back the previous page.  Clear them here
++ * after a polled wait, and fold in what the ECC ISR would have recorded.
++ */
++
++static inline void GPMI_PolledComplete(bool complete)
++{
++    BF_CLR(APBH_CTRL1, CH4_CMDCMPLT_IRQ);
++    BF_CLR(APBH_CTRL1, CH4_AHB_ERROR_IRQ);
++
++    if (complete && !ECC_FIN)
++    {
++        ECCResult = BF_RD(ECC8_STATUS1, STATUS_PAYLOAD0)            |
++                    (BF_RD(ECC8_STATUS1, STATUS_PAYLOAD1) << 8)     |
++                    (BF_RD(ECC8_STATUS1, STATUS_PAYLOAD2) << 16)    |
++                    (BF_RD(ECC8_STATUS1, STATUS_PAYLOAD3) << 24)    ;
++
++        BF_CLR(ECC8_CTRL, COMPLETE_IRQ);
++        BF_CLR(ECC8_CTRL, BM_ERROR_IRQ);
++
++        ECC_FIN = true;
++        MTD_upOpaFin(ECCResult);
++    }
++}
++
+ static inline void   GPMI_ReadPage(uint32_t ColumnAddress, uint32_t RowAddress, uint32_t *data, uint32_t *auxData, bool block)
+ {
+     volatile uint8_t *probe;
+@@ -1180,6 +1210,9 @@ static inline void   GPMI_ReadPage(uint32_t ColumnAddress, uint32_t RowAddress,
+                 if (++spin > 5000000u)
+                     break;
+             }
++
++            GPMI_PolledComplete(spin <= 5000000u);
++
+         }
+ }
+ 
+diff --git a/arch/arm/src/stmp3770/stmp3770_memorymap.h b/arch/arm/src/stmp3770/stmp3770_memorymap.h
+index 316a6380..121c1fb0 100644
+--- a/arch/arm/src/stmp3770/stmp3770_memorymap.h
++++ b/arch/arm/src/stmp3770/stmp3770_memorymap.h
+@@ -57,38 +57,35 @@
+ 
+ #ifdef CONFIG_STMP3770_PAGING
+ 
+-/* 按需分页布局（4 KB 页，见 docs/khicas.md）。
++/* On-demand paging layout (4 KB pages, see docs/khicas.md).
+  *
+- * 物理：[0x00000, 0x3C000) 240 KB 常驻镜像   60 页
+- *       [0x3C000, 0x4C000)  64 KB 代码帧     16 页
+- *       [0x4C000, 0x78000) 176 KB 数据/堆    44 页
+- *       [0x78000, 0x7C000)  16 KB L1
+- *       [0x7C000, 0x7D000)   4 KB L2 粗表（段 0..3）
++ * The whole first megabyte stays one identity section, so the image, the
++ * heap, the stacks and both page tables are reached at their physical
++ * addresses.  The paged window is a separate 3.75 MB virtual range above
++ * the physical RAM, mapped through four coarse tables:
+  *
+- * 虚拟：常驻同上，窗口 [0x3C000, 0x3BC000) 3.5 MB，数据区
+- *       [0x3BC000, 0x3E8000)。页表仍按 identity 访问，而它们的虚拟地址
+- *       落在窗口里，所以那几页在窗口内被固定映射（窗口第 60..67 页保留）。
++ * 物理：[0x00000, 0x6B000)  镜像 + 堆（identity，1MB section）
++ *       [0x6B000, 0x6C000)  L2 粗页表（4 张 × 1KB）
++ *       [0x6C000, 0x7C000)  16 个 4KB 代码帧
++ *       [0x7C000, 0x80000)  L1 页表（16KB）
++ *
++ * 虚拟：[0x400000, 0x7C0000) 3.75 MB 窗口（960 页），L1[4..7]
++ *
++ * 窗口在物理 RAM 之上，所以页表、堆、栈都不会落进可分页区域，
++ * 也就没有了“页表自己要固定映射”这种特例。
+  */
+ 
+-#  define STMP3770_PAGED_VBASE     0x0003c000u
+-#  define STMP3770_PAGED_VEND      0x003bc000u
+-#  define STMP3770_PAGED_NPAGES    \
+-  ((STMP3770_PAGED_VEND - STMP3770_PAGED_VBASE) >> 12)
+-#  define STMP3770_FRAME_PBASE     0x0003c000u
++#  define STMP3770_PAGED_VBASE     0x00400000u
++#  define STMP3770_PAGED_NPAGES    960u
++#  define STMP3770_PAGED_VEND      \
++        (STMP3770_PAGED_VBASE + (STMP3770_PAGED_NPAGES << 12))
++#  define STMP3770_FRAME_PBASE     0x0006c000u
+ #  define STMP3770_NFRAMES         16u
+-#  define STMP3770_DATA_VBASE      0x003bc000u
+-#  define STMP3770_DATA_PBASE      0x0004c000u
+-#  define STMP3770_DATA_NPAGES     44u
+-#  define STMP3770_LOCKED_NPAGES   60u
+-#  define STMP3770_PGTABLE_VBASE   0x00078000u
+-
+-#  define PGTABLE_BASE_PADDR       STMP3770_PGTABLE_VBASE
+-#  define PGTABLE_BASE_VADDR       STMP3770_PGTABLE_VBASE
+-#  define PGTABLE_L2_COARSE_OFFSET 0x00004000
+-#  define PGTABLE_L2_COARSE_PBASE  (PGTABLE_BASE_PADDR + PGTABLE_L2_COARSE_OFFSET)
+-#  define PGTABLE_L2_FINE_OFFSET   0x00004000
+-#  define PGTABLE_L2_FINE_PBASE    (PGTABLE_BASE_PADDR + PGTABLE_L2_FINE_OFFSET)
+-#  define STMP3770_HEAP_VEND       PGTABLE_BASE_PADDR
++#  define STMP3770_L2_PBASE        0x0006b000u
++#  define STMP3770_HEAP_VEND       0x0006b000u
++#  define PGTABLE_BASE_PADDR       0x0007c000u
++#  define PGTABLE_BASE_VADDR       0x0007c000u
++#  define STMP3770_PGTABLE_VBASE   PGTABLE_BASE_PADDR
+ 
+ #else
+ 
+diff --git a/arch/arm/src/stmp3770/stmp3770_pager.c b/arch/arm/src/stmp3770/stmp3770_pager.c
+index 037875a7..dfa30b15 100644
+--- a/arch/arm/src/stmp3770/stmp3770_pager.c
++++ b/arch/arm/src/stmp3770/stmp3770_pager.c
+@@ -54,8 +54,20 @@
+  ****************************************************************************/
+ 
+ static FAR struct mtd_dev_s *g_pager_mtd;
++static uint32_t               g_blob_block = PAGER_BLOB_BLOCK;
+ static uint32_t               g_next_frame;
+ 
++/* Reverse map: which virtual page each frame currently holds.  Without it,
++ * reusing a frame leaves the previous virtual page's L2 entry pointing at
++ * memory that now belongs to a different page -- fine for a single forward
++ * sweep (which is how the self-test ran) and fatal for real code that
++ * revisits pages.
++ */
++
++#define PAGER_NO_VA 0xffffffffu
++static uint32_t g_frame_va[STMP3770_NFRAMES];
++static bool     g_frames_init;
++
+ /****************************************************************************
+  * Private Functions
+  ****************************************************************************/
+@@ -74,6 +86,15 @@ void stmp3770_pager_setmtd(FAR struct mtd_dev_s *mtd)
+   g_pager_mtd = mtd;
+ }
+ 
++/* Point the pager at a blob that starts at 'block'.  The blob is a flat
++ * 4 KB-per-page image whose first page lands at STMP3770_PAGED_VBASE.
++ */
++
++void stmp3770_pager_setblob(uint32_t block)
++{
++  g_blob_block = block;
++}
++
+ /****************************************************************************
+  * Name: stmp3770_pagefault
+  *
+@@ -104,6 +125,18 @@ bool stmp3770_pagefault(uint32_t far)
+       return false;
+     }
+ 
++  if (!g_frames_init)
++    {
++      uint32_t i;
++
++      for (i = 0; i < STMP3770_NFRAMES; i++)
++        {
++          g_frame_va[i] = PAGER_NO_VA;
++        }
++
++      g_frames_init = true;
++    }
++
+   va    = far & ~(PAGER_PTESIZE - 1);
+   frame = g_next_frame++ % STMP3770_NFRAMES;
+ 
+@@ -111,6 +144,21 @@ bool stmp3770_pagefault(uint32_t far)
+   l2  = (uint32_t *)(l1[va >> 20] & 0xfffffc00);
+   ndx = (va & 0x000fffff) >> 12;
+ 
++  /* If this frame is in use, drop the mapping of the page it currently
++   * holds before handing the frame to the new page.
++   */
++
++  if (g_frame_va[frame] != PAGER_NO_VA)
++    {
++      uint32_t oldva = g_frame_va[frame];
++      uint32_t *ol2  = (uint32_t *)(l1[oldva >> 20] & 0xfffffc00);
++
++      ol2[(oldva & 0x000fffff) >> 12] = 0;
++      pager_tlb_invalidate(oldva);
++    }
++
++  g_frame_va[frame] = va;
++
+   /* Map first: the frame is only reachable through the window, and nothing
+    * else can look at it while we are in the fault handler.
+    */
+@@ -121,10 +169,11 @@ bool stmp3770_pagefault(uint32_t far)
+   pager_tlb_invalidate(va);
+   __asm volatile ("mcr p15, 0, %0, c7, c10, 4" :: "r" (0) : "memory");
+ 
+-  offset = (off_t)PAGER_BLOB_BLOCK * PAGER_PAGES_PBLK * 2048 +
++  offset = (off_t)g_blob_block * PAGER_PAGES_PBLK * 2048 +
+            (off_t)((va - STMP3770_PAGED_VBASE) >> 12) * PAGER_PTESIZE;
+ 
+   nread = MTD_READ(g_pager_mtd, offset, PAGER_PTESIZE, (FAR uint8_t *)va);
++
+   if (nread != PAGER_PTESIZE)
+     {
+       /* Leave the page unmapped so the fault repeats (and the kernel panics
+diff --git a/boards/arm/stmp3770/hp39gii/configs/nsh/defconfig b/boards/arm/stmp3770/hp39gii/configs/nsh/defconfig
+index 96f12b9e..f116ecc6 100644
+--- a/boards/arm/stmp3770/hp39gii/configs/nsh/defconfig
++++ b/boards/arm/stmp3770/hp39gii/configs/nsh/defconfig
+@@ -75,6 +75,8 @@ CONFIG_UART0_CLK_FREQ=24000000
+ CONFIG_MTD_PARTITION=y
+ CONFIG_FSUTILS_MKSMARTFS=y
+ CONFIG_STMP3770_MMU=y
++CONFIG_STMP3770_PAGING=y
++CONFIG_STMP3770_KHICAS=y
+ CONFIG_ARM_DCACHE_DISABLE=y
+ # CONFIG_STMP3770_PAGING is not set
+ # CONFIG_STMP3770_PAGETEST is not set
+diff --git a/boards/arm/stmp3770/hp39gii/scripts/ld.script b/boards/arm/stmp3770/hp39gii/scripts/ld.script
+index 568e01bf..648a0f54 100644
+--- a/boards/arm/stmp3770/hp39gii/scripts/ld.script
++++ b/boards/arm/stmp3770/hp39gii/scripts/ld.script
+@@ -17,6 +17,11 @@
+ MEMORY
+ {
+   sram (rwx) : ORIGIN = 0x00000000, LENGTH = 512K
++  /* On-demand paging window: 0x400000..0x7C0000, mapped by
++   * stmp3770_map_paged().  The image here is not loaded by the boot ROM;
++   * it is extracted to khicas.paged and paged in from NAND at run time.
++   */
++  pgwin (rwx) : ORIGIN = 0x00400000, LENGTH = 0x003C0000
+ }
+ 
+ OUTPUT_ARCH(arm)
+@@ -24,6 +29,23 @@ ENTRY(_stext)
+ 
+ SECTIONS
+ {
++    /* KhiCAS: the giac engine and the C++ runtime it drags in live in the
++     * paged window.  Everything else stays resident.  This must come before
++     * the generic .rodata rule so .data.rel.ro from these archives lands in
++     * the window too.
++     */
++
++    .pgtext : {
++        _spgtext = ABSOLUTE(.);
++        *libcas.libcpp:*(.text .text.* .rodata .rodata.* .data.rel.ro .data.rel.ro.*)
++        *libtommath.libcpp:*(.text .text.* .rodata .rodata.* .data.rel.ro .data.rel.ro.*)
++        *libstdc++.a:*(.text .text.* .rodata .rodata.* .data.rel.ro .data.rel.ro.*)
++        *libsupc++.a:*(.text .text.* .rodata .rodata.* .data.rel.ro .data.rel.ro.*)
++        *(.pgtext .pgtext.*)
++        . = ALIGN(4096);
++        _epgtext = ABSOLUTE(.);
++    } > pgwin
++
+     .text : {
+         _stext = ABSOLUTE(.);
+         KEEP(*(.vectors))
+diff --git a/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c b/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c
+index 43f834be..039d587c 100644
+--- a/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c
++++ b/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c
+@@ -21,11 +21,13 @@
+ #include <nuttx/board.h>
+ #include <nuttx/kthread.h>
+ #include <nuttx/sched.h>
++#include <nuttx/semaphore.h>
+ #include <nuttx/serial/uart_pl011.h>
+ #include <arch/board/board.h>
+ 
+ #include <unistd.h>
+ #include <fcntl.h>
++#include <sys/stat.h>
+ 
+ #include "arm_internal.h"
+ #include "chip.h"
+@@ -198,8 +200,20 @@ FAR struct mtd_dev_s *stmp3770_nand_initialize(void);
+  *   243..244   NuttX 镜像（安装工具写入）
+  *   245..1023  SmartFS 卷（779 块 ≈ 97.4 MB）
+  */
+-#define HP39GII_NAND_FS_FIRST   245
+-#define HP39GII_NAND_FS_BLOCKS  779
++/* Blocks 240..246 belong to the menu and to NuttX: the menu is one block and
++ * the NuttX image is three (it grew past 192 KB when KhiCAS came in), and the
++ * menu's loader needs the image to land below where the menu runs.
++ */
++
++#define HP39GII_NAND_FS_FIRST   247
++#define HP39GII_NAND_FS_BLOCKS  553
++
++/* KhiCAS: install_menu.py writes the paged engine here, past the file system
++ * partition (blocks 245..799).  The first boot copies it into /mnt and then
++ * erases the staging area -- see nand_install_khicas().
++ */
++
++#define HP39GII_NAND_BLOB_FIRST 800
+ 
+ #define HP39GII_NAND_PAGE_SIZE  2048
+ #define HP39GII_NAND_PAGES_PBLK 64
+@@ -255,6 +269,83 @@ static void nand_print_num(FAR const char *tag, uint32_t v)
+  * 并读回复核。返回 0=本来就正常，1=已修复，负值=修复失败。
+  */
+ 
++static FAR struct mtd_dev_s *g_nand_mtd;
++
++/* Other parts of the board (the KhiCAS app) need the NAND MTD the file
++ * system was set up on.
++ */
++
++FAR struct mtd_dev_s *hp39gii_nand_mtd(void)
++{
++  return g_nand_mtd;
++}
++
++/* KhiCAS: run the engine in its own thread with a large stack.  The giac
++ * context constructor and the parser are deep; the NSH task's stack is a
++ * couple of kilobytes and overflows immediately.
++ */
++
++#ifdef CONFIG_STMP3770_KHICAS
++static sem_t g_khicas_done;
++
++static int khicas_thread(int argc, FAR char **argv)
++{
++  extern int khicas_main(int argc, char **argv);
++
++  khicas_main(argc, argv);
++  nxsem_post(&g_khicas_done);
++  return 0;
++}
++
++int hp39gii_khicas_run(int argc, FAR char **argv)
++{
++  int pid;
++
++  nxsem_init(&g_khicas_done, 0, 0);
++  pid = kthread_create("khicas", SCHED_PRIORITY_DEFAULT, 16384,
++                       khicas_thread, NULL);
++  if (pid < 0)
++    {
++      return pid;
++    }
++
++  nxsem_wait(&g_khicas_done);
++  nxsem_destroy(&g_khicas_done);
++  return 0;
++}
++#endif
++
++/* Is there a non-erased page at the start of a raw blob region?  Used by the
++ * KhiCAS app to tell "the engine was never installed" from "run it".
++ */
++
++int hp39gii_nand_blob_state(uint32_t block)
++{
++  static uint8_t page[2048] __attribute__((aligned(32)));
++  int i;
++
++  if (g_nand_mtd == NULL)
++    {
++      return -1;
++    }
++
++  if (g_nand_mtd->bread(g_nand_mtd, (off_t)block * HP39GII_NAND_PAGES_PBLK,
++                        1, page) != 1)
++    {
++      return -1;
++    }
++
++  for (i = 0; i < (int)sizeof(page); i++)
++    {
++      if (page[i] != 0xff)
++        {
++          return 1;
++        }
++    }
++
++  return 0;
++}
++
+ static int nand_fix_ncb_backup(FAR struct mtd_dev_s *mtd)
+ {
+   static uint8_t ncb[HP39GII_NAND_PAGE_SIZE] __attribute__((aligned(32)));
+@@ -384,6 +475,157 @@ static int nand_fs_test(void)
+ /* NAND + 文件系统 bring-up。放在低优先级内核线程里跑：GPMI 的读写都是
+  * 轮询等待，SmartFS 挂载时还要扫一遍卷头（约几秒），不能挡在启动路径上。 */
+ 
++/* KhiCAS ships as a file, not as part of the kernel image.  The engine's
++ * 3.1 MB of code cannot be loaded into RAM, so the file is not executed
++ * directly: the on-demand pager maps one 4 KB page at a time out of it while
++ * it runs (see stmp3770_pager.c).  Keeping it a regular file means the app
++ * can be replaced without touching the kernel.
++ *
++ * A freshly flashed unit has no such file yet -- install_menu.py puts the
++ * engine in the raw staging area instead -- so the first boot copies it in
++ * and erases the staging copy, after which the file is the master.
++ */
++
++static void nand_install_khicas(FAR struct mtd_dev_s *mtd)
++{
++#ifdef CONFIG_STMP3770_KHICAS
++  extern char _spgtext[];
++  extern char _epgtext[];
++  static uint8_t fbuf[4096] __attribute__((aligned(32)));
++  static uint8_t rbuf[4096] __attribute__((aligned(32)));
++  uint32_t size = (uint32_t)(_epgtext - _spgtext);
++  struct stat st;
++  size_t  nblocks;
++  off_t   off;
++  int     fd;
++  int     same;
++
++  if (size == 0)
++    {
++      return;
++    }
++
++  if (stat("/mnt/khicas.bin", &st) != 0 ||
++      (uint32_t)st.st_size != size)
++    {
++      /* Freshly flashed unit: the engine is sitting in the raw staging area
++       * and there is no file yet (or the file is stale).  Publish it.
++       */
++
++      if (hp39gii_nand_blob_state(HP39GII_NAND_BLOB_FIRST) != 1)
++        {
++          nand_put("khicas app MISSING");
++          return;
++        }
++
++      nand_put("installing khicas...");
++
++      fd = open("/mnt/khicas.bin", O_WRONLY | O_CREAT | O_TRUNC);
++      if (fd < 0)
++        {
++          nand_put("khicas app OPEN FAILED");
++          nand_print_num("errno ", (uint32_t)errno);
++          return;
++        }
++
++      for (off = 0; (uint32_t)off < size; off += sizeof(rbuf))
++        {
++          size_t n = (uint32_t)(size - off) < sizeof(rbuf) ?
++                     (size_t)(size - off) : sizeof(rbuf);
++          off_t  src = (off_t)HP39GII_NAND_BLOB_FIRST *
++                       HP39GII_NAND_PAGES_PBLK * HP39GII_NAND_PAGE_SIZE + off;
++
++          if (mtd->read(mtd, src, n, rbuf) != (ssize_t)n ||
++              write(fd, rbuf, n) != (ssize_t)n)
++            {
++              close(fd);
++              nand_put("khicas app COPY FAILED");
++              return;
++            }
++        }
++
++      close(fd);
++      nand_put("khicas app installed");
++      return;
++    }
++
++  /* The file exists and has the right size.  The pager cannot read through
++   * the file system from inside an abort handler (the VFS is not reentrant
++   * that way), so keep the staging copy in sync with the file and page from
++   * there.  A unit that never touches the file pays one memcmp per boot.
++   */
++
++  fd = open("/mnt/khicas.bin", O_RDONLY);
++  if (fd < 0)
++    {
++      nand_put("khicas app OPEN FAILED");
++      return;
++    }
++
++  same = 1;
++  for (off = 0; (uint32_t)off < size; off += sizeof(rbuf))
++    {
++      size_t n = (uint32_t)(size - off) < sizeof(rbuf) ?
++                 (size_t)(size - off) : sizeof(rbuf);
++      off_t  dst = (off_t)HP39GII_NAND_BLOB_FIRST *
++                   HP39GII_NAND_PAGES_PBLK * HP39GII_NAND_PAGE_SIZE + off;
++
++      if (read(fd, fbuf, n) != (ssize_t)n ||
++          mtd->read(mtd, dst, n, rbuf) != (ssize_t)n ||
++          memcmp(fbuf, rbuf, n) != 0)
++        {
++          same = 0;
++          break;
++        }
++    }
++
++  close(fd);
++
++  if (same)
++    {
++      nand_put("khicas app OK");
++      return;
++    }
++
++  /* Stage the file into the raw area the pager reads. */
++
++  nand_put("staging khicas...");
++
++  nblocks = ((size + HP39GII_NAND_PAGES_PBLK * HP39GII_NAND_PAGE_SIZE - 1) /
++             (HP39GII_NAND_PAGES_PBLK * HP39GII_NAND_PAGE_SIZE));
++  mtd->erase(mtd, (off_t)HP39GII_NAND_BLOB_FIRST, nblocks);
++
++  fd = open("/mnt/khicas.bin", O_RDONLY);
++  if (fd < 0)
++    {
++      nand_put("khicas app OPEN FAILED");
++      return;
++    }
++
++  for (off = 0; (uint32_t)off < size; off += HP39GII_NAND_PAGE_SIZE)
++    {
++      size_t n = (uint32_t)(size - off) < HP39GII_NAND_PAGE_SIZE ?
++                 (size_t)(size - off) : HP39GII_NAND_PAGE_SIZE;
++      off_t  dst = (off_t)HP39GII_NAND_BLOB_FIRST *
++                   HP39GII_NAND_PAGES_PBLK + (off / HP39GII_NAND_PAGE_SIZE);
++
++      memset(fbuf, 0xff, HP39GII_NAND_PAGE_SIZE);
++      if (read(fd, fbuf, n) != (ssize_t)n ||
++          mtd->bwrite(mtd, dst, 1, fbuf) != 1)
++        {
++          close(fd);
++          nand_put("khicas app STAGE FAILED");
++          return;
++        }
++    }
++
++  close(fd);
++  nand_put("khicas app staged");
++#else
++  (void)mtd;
++#endif
++}
++
+ static int hp39gii_nand_thread(int argc, char **argv)
+ {
+   FAR struct mtd_dev_s *mtd;
+@@ -400,6 +642,7 @@ static int hp39gii_nand_thread(int argc, char **argv)
+   nand_put("NAND init...");
+ 
+   mtd = stmp3770_nand_initialize();
++  g_nand_mtd = mtd;
+   if (mtd == NULL)
+     {
+       nand_put("NAND init FAILED");
+@@ -533,6 +776,8 @@ static int hp39gii_nand_thread(int argc, char **argv)
+       nand_put("mounted /mnt");
+     }
+ 
++  nand_install_khicas(mtd);
++
+   ret = nand_fs_test();
+   if (ret > 0)
+     {
+diff --git a/boards/arm/stmp3770/hp39gii/src/hp39gii_pagetest.c b/boards/arm/stmp3770/hp39gii/src/hp39gii_pagetest.c
+index fa7e963d..53531b05 100644
+--- a/boards/arm/stmp3770/hp39gii/src/hp39gii_pagetest.c
++++ b/boards/arm/stmp3770/hp39gii/src/hp39gii_pagetest.c
+@@ -38,19 +38,12 @@
+ #define PGTEST_NBLOCKS   \
+   ((PGTEST_NPAGES * PGTEST_PGSIZE) / (PGTEST_PAGES_PBLK * 2048))
+ 
+-/* The page tables live inside the address range of the window and are pinned
+- * there (see stmp3770_map_paged()), so those pages never fault and must not
+- * be called as code.
++/* Thumb stub: ldr r0, [pc, #0] ; bx lr ; .word index.  The giac engine is
++ * Thumb code, so the paged path has to be exercised in Thumb state too.
+  */
+ 
+-#define PGTEST_PINNED_FIRST \
+-  ((STMP3770_PGTABLE_VBASE - STMP3770_PAGED_VBASE) / PGTEST_PGSIZE)
+-#define PGTEST_PINNED_LAST  (PGTEST_PINNED_FIRST + 8)
+-
+-/* ldr r0, [pc, #0] ; bx lr ; .word index */
+-
+-#define PGTEST_STUB_LDR   0xe59f0000u
+-#define PGTEST_STUB_BXLR  0xe12fff1eu
++#define PGTEST_STUB_LDR   0x4800u      /* ldr r0, [pc, #0] */
++#define PGTEST_STUB_BXLR  0x4770u      /* bx lr */
+ 
+ /****************************************************************************
+  * Private Functions
+@@ -141,9 +134,9 @@ void hp39gii_pagetest(FAR struct mtd_dev_s *mtd)
+   for (i = 0; i < PGTEST_NPAGES; i++)
+     {
+       memset(buf, 0, sizeof(buf));
+-      *(uint32_t *)&buf[0]  = PGTEST_STUB_LDR;
+-      *(uint32_t *)&buf[4]  = PGTEST_STUB_BXLR;
+-      *(uint32_t *)&buf[8]  = (uint32_t)i;
++      *(uint16_t *)&buf[0]  = PGTEST_STUB_LDR;
++      *(uint16_t *)&buf[2]  = PGTEST_STUB_BXLR;
++      *(uint32_t *)&buf[4]  = (uint32_t)i;
+ 
+       ret = MTD_BWRITE(mtd, PGTEST_BLOB_BLOCK * PGTEST_PAGES_PBLK +
+                             i * PGTEST_RW_PER_PG,
+@@ -161,12 +154,7 @@ void hp39gii_pagetest(FAR struct mtd_dev_s *mtd)
+ 
+   for (i = 0; i < PGTEST_NPAGES; i++)
+     {
+-      if (i >= PGTEST_PINNED_FIRST && i < PGTEST_PINNED_LAST)
+-        {
+-          continue;
+-        }
+-
+-      fn  = (pagefn_t)(uintptr_t)(STMP3770_PAGED_VBASE + i * PGTEST_PGSIZE);
++      fn  = (pagefn_t)(uintptr_t)(STMP3770_PAGED_VBASE + i * PGTEST_PGSIZE + 1);
+       val = fn();
+       tested++;
+ 
+diff --git a/boards/arm/stmp3770/hp39gii/src/khicas/khicas_app.cpp b/boards/arm/stmp3770/hp39gii/src/khicas/khicas_app.cpp
+new file mode 100644
+index 00000000..60d4a682
+--- /dev/null
++++ b/boards/arm/stmp3770/hp39gii/src/khicas/khicas_app.cpp
+@@ -0,0 +1,383 @@
++/****************************************************************************
++ * boards/arm/stmp3770/hp39gii/src/khicas/khicas_app.cpp
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * KhiCAS on the HP 39gII: the resident half of the application.
++ *
++ * The giac engine is ~3 MB of code and does not fit in the 512 KB of SRAM,
++ * so it is linked into the paged window (see the .pgtext section in the
++ * linker script) and demand-paged from a blob on NAND by
++ * stmp3770_pagefault().  Everything in this file is small enough to stay
++ * resident, and it also supplies the platform functions the engine expects
++ * (display, keyboard, clock, files) plus a text REPL on the LCD console.
++ *
++ ****************************************************************************/
++
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <fcntl.h>
++#include <errno.h>
++#include <time.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++
++#include "giac.h"
++
++/* -------------------------------------------------------------------------
++ * Platform hooks provided by the port.
++ * ------------------------------------------------------------------------- */
++
++extern "C" void stmp3770_lcdcon_putc(int ch);
++extern "C" void stmp3770_lcdcon_puts(const char *s);
++extern "C" void stmp3770_pager_setblob(uint32_t block);
++
++/* Board helper (hp39gii_boot.c): 1 = blob present, 0 = NAND erased,
++ * negative = NAND not ready.  Kept on the C side so this file needs no
++ * NuttX headers, which do not coexist with the newlib headers that the
++ * prebuilt C++ runtime expects.
++ */
++
++extern "C" int hp39gii_nand_blob_state(uint32_t block);
++extern "C" int usleep(unsigned int usec);
++
++#define KHICAS_BLOB_BLOCK 800
++#define KHICAS_BLOB_FILE  "/mnt/khicas.bin"
++
++/* -------------------------------------------------------------------------
++ * Globals the engine and the UI expect.
++ * ------------------------------------------------------------------------- */
++
++int lang;                       /* 0 = English */
++int nspirelua;
++int warn_nr;
++int LCD_WIDTH_PX;
++int LCD_HEIGHT_PX;
++
++extern "C" void Sleep(int millisecond)
++{
++  usleep((unsigned int)millisecond * 1000);
++}
++
++extern "C" int RTC_GetTicks(void)
++{
++  return (int)((long long)clock() * 1000 / CLOCKS_PER_SEC);
++}
++
++extern "C" void RTC_SetDateTime(unsigned char *datetime)
++{
++  (void)datetime;
++}
++
++extern "C" int GetKey(int *key)
++{
++  if (key != NULL)
++    {
++      *key = 0;
++    }
++
++  return 0;
++}
++
++extern "C" bool IsKeyDown(int key)
++{
++  (void)key;
++  return false;
++}
++
++extern "C" bool file_exists(const char *filename)
++{
++  return filename != NULL && access(filename, F_OK) == 0;
++}
++
++const char *gettext(const char *msg)
++{
++  return msg;
++}
++
++namespace giac
++{
++  int rtc_get_tick_ms()
++  {
++    return (int)((long long)clock() * 1000 / CLOCKS_PER_SEC);
++  }
++}
++
++/* -------------------------------------------------------------------------
++ * File and display calls used by the GUI half of KhiCAS.  The console REPL
++ * does not use them; they exist so the engine's command table links, and
++ * they will be filled in when the full UI is ported.
++ * ------------------------------------------------------------------------- */
++
++struct DISPBOX
++{
++  int x1;
++  int y1;
++  int x2;
++  int y2;
++};
++
++/* Drawing primitives the engine's graphics commands call.  The console
++ * REPL has no framebuffer, so they are inert for now.
++ */
++
++extern "C" void vGL_putString(int x0, int y0, const char *s, int fg, int bg,
++                              int fontsize)
++{
++  (void)x0; (void)y0; (void)s; (void)fg; (void)bg; (void)fontsize;
++}
++
++extern "C" void vGL_SetPoint(unsigned int x, unsigned int y, int color)
++{
++  (void)x; (void)y; (void)color;
++}
++
++extern "C" int vGL_GetPoint(unsigned int x, unsigned int y)
++{
++  (void)x; (void)y;
++  return 0;
++}
++
++extern "C" void vGL_FlushVScreen(void)
++{
++}
++
++extern "C" int select_item(void)
++{
++  return 0;
++}
++
++void Bdisp_AreaFillVRAM(DISPBOX *area, unsigned short color)
++{
++  (void)area;
++  (void)color;
++}
++
++int Bfile_OpenFile_OS(unsigned short *name, int mode)
++{
++  (void)name;
++  (void)mode;
++  return -1;
++}
++
++int Bfile_CloseFile_OS(int handle)
++{
++  (void)handle;
++  return 0;
++}
++
++int Bfile_ReadFile(int handle, void *buf, int size, int pos)
++{
++  (void)handle;
++  (void)buf;
++  (void)size;
++  (void)pos;
++  return 0;
++}
++
++int Bfile_GetFileSize_OS(int handle)
++{
++  (void)handle;
++  return 0;
++}
++
++void Bfile_StrToName_ncpy(unsigned short *dst, const unsigned char *src, int n)
++{
++  (void)dst;
++  (void)src;
++  (void)n;
++}
++
++/* -------------------------------------------------------------------------
++ * Console helpers.
++ * ------------------------------------------------------------------------- */
++
++static void out(const char *s)
++{
++  stmp3770_lcdcon_puts(s);
++}
++
++static void outln(const char *s)
++{
++  stmp3770_lcdcon_puts(s);
++  stmp3770_lcdcon_puts("\r\n");
++}
++
++/* -------------------------------------------------------------------------
++ * Is the paged blob on NAND?  An erased first page means it was never
++ * installed.
++ * ------------------------------------------------------------------------- */
++
++static int khicas_blob_state(void)
++{
++  return hp39gii_nand_blob_state(KHICAS_BLOB_BLOCK);
++}
++
++/* -------------------------------------------------------------------------
++ * One line of input from the LCD console.  /dev/lcdcon echoes printable
++ * characters itself; we only have to erase on backspace.
++ * ------------------------------------------------------------------------- */
++
++static int khicas_readline(int fd, std::string &line)
++{
++  line.clear();
++
++  for (; ; )
++    {
++      char ch;
++      ssize_t n = read(fd, &ch, 1);
++
++      if (n <= 0)
++        {
++          return -1;
++        }
++
++      if (ch == '\n')
++        {
++          return 0;
++        }
++
++      if (ch == 0x08 || ch == 0x7f)
++        {
++          if (!line.empty())
++            {
++              line.erase(line.size() - 1);
++              stmp3770_lcdcon_puts("\b \b");
++            }
++
++          continue;
++        }
++
++      if (ch >= 0x20 && ch < 0x7f)
++        {
++          line.push_back(ch);
++        }
++    }
++}
++
++/* -------------------------------------------------------------------------
++ * C++ static initialisation.
++ *
++ * NuttX only runs .init_array when CONFIG_HAVE_CXXINITIALIZE is set, and
++ * that option also pulls in the NuttX C++ runtime, which is ABI-incompatible
++ * with the newlib-based libstdc++ the giac archives were built against.  So
++ * the firmware is a C build and the constructors of the C++ objects that the
++ * engine uses are run here, once, before giac is touched.
++ * ------------------------------------------------------------------------- */
++
++extern "C" void (*_sinit[])(void);
++extern "C" void (*_einit[])(void);
++
++static void khicas_cxx_init(void)
++{
++  static bool inited;
++  void (**p)(void);
++
++  if (inited)
++    {
++      return;
++    }
++
++  inited = true;
++
++  for (p = _sinit; p < _einit; p++)
++    {
++      if (*p != NULL)
++        {
++          (*p)();
++        }
++    }
++}
++
++/* -------------------------------------------------------------------------
++ * Entry point: the NSH command "khicas" calls this.
++ * ------------------------------------------------------------------------- */
++
++extern "C" int khicas_main(int argc, char **argv)
++{
++  giac::context *ctx;
++  std::string line;
++  int fd;
++
++  (void)argc;
++  (void)argv;
++
++  outln("");
++  outln("KhiCAS - giac on NuttX");
++
++  /* The engine is a file on the NAND file system (/mnt/khicas.bin).  It is
++   * too big to run from RAM, so the loader reads it page by page out of the
++   * raw staging area that boot fills from that file (see
++   * nand_install_khicas()).
++   */
++
++  if (khicas_blob_state() != 1)
++    {
++      outln("paged engine missing:");
++      outln("no " KHICAS_BLOB_FILE);
++      return 1;
++    }
++
++  stmp3770_pager_setblob(KHICAS_BLOB_BLOCK);
++
++  khicas_cxx_init();
++
++  outln("starting engine...");
++
++  ctx = new giac::context;
++  if (ctx == NULL)
++    {
++      outln("out of memory");
++      return 1;
++    }
++
++  fd = open("/dev/lcdcon", O_RDONLY);
++  if (fd < 0)
++    {
++      outln("no console");
++      delete ctx;
++      return 1;
++    }
++
++  outln("type quit to leave");
++  outln("");
++
++  for (; ; )
++    {
++      giac::gen parsed;
++      giac::gen result;
++      std::string printed;
++
++      out("CAS> ");
++
++      if (khicas_readline(fd, line) < 0)
++        {
++          break;
++        }
++
++      if (line.empty())
++        {
++          continue;
++        }
++
++      if (line == "quit" || line == "exit")
++        {
++          break;
++        }
++
++      parsed = giac::gen(line.c_str(), ctx);
++      result = giac::eval(parsed, ctx);
++      printed = result.print(ctx);
++
++      out(printed.c_str());
++      out("\r\n");
++    }
++
++  close(fd);
++  delete ctx;
++  outln("bye");
++  return 0;
++}
+diff --git a/boards/arm/stmp3770/hp39gii/src/khicas/khicas_compat.c b/boards/arm/stmp3770/hp39gii/src/khicas/khicas_compat.c
+new file mode 100644
+index 00000000..a3c629cb
+--- /dev/null
++++ b/boards/arm/stmp3770/hp39gii/src/khicas/khicas_compat.c
+@@ -0,0 +1,104 @@
++/****************************************************************************
++ * boards/arm/stmp3770/hp39gii/src/khicas/khicas_compat.c
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * The giac archives in the ExistOS tree were built against newlib.  NuttX
++ * has its own libc, so a handful of newlib-only symbols have to be provided
++ * here: the ctype table (giac uses the ctype macros directly), the assert
++ * hooks, the C-locale collation stubs and the multibyte maximum.
++ *
++ ****************************************************************************/
++
++#include <stddef.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++/* newlib's _ctype_ table, copied byte for byte from lib_a-ctype_.o in the
++ * toolchain's libc.a.  _ctype_[0] is the EOF entry; the ctype macros index
++ * with (_ctype_ + 1)[c].
++ */
++
++const unsigned char _ctype_[257] =
++{
++  0x00, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
++  0x20, 0x20, 0x28, 0x28, 0x28, 0x28, 0x28, 0x20,
++  0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
++  0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
++  0x20, 0x88, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10,
++  0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10,
++  0x10, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04,
++  0x04, 0x04, 0x04, 0x10, 0x10, 0x10, 0x10, 0x10,
++  0x10, 0x10, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41,
++  0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
++  0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
++  0x01, 0x01, 0x01, 0x01, 0x10, 0x10, 0x10, 0x10,
++  0x10, 0x10, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
++  0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02,
++  0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02,
++  0x02, 0x02, 0x02, 0x02, 0x10, 0x10, 0x10, 0x10,
++  0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00,
++};
++
++int __locale_mb_cur_max(void)
++{
++  return 1;
++}
++
++void __assert_func(const char *file, int line, const char *func,
++                   const char *expr)
++{
++  fprintf(stderr, "assert failed: %s:%d %s%s\n", file, line,
++          func ? func : "", expr ? expr : "");
++  abort();
++}
++
++void _assert(const char *expr)
++{
++  fprintf(stderr, "assert failed: %s\n", expr ? expr : "");
++  abort();
++}
++
++size_t strxfrm(char *dest, const char *src, size_t n)
++{
++  size_t len = strlen(src);
++
++  if (n > 0)
++    {
++      size_t copy = (len < n - 1) ? len : n - 1;
++
++      memcpy(dest, src, copy);
++      dest[copy] = '\0';
++    }
++
++  return len;
++}
++
++int strcoll(const char *s1, const char *s2)
++{
++  return strcmp(s1, s2);
++}
++
++char *setlocale(int category, const char *locale)
++{
++  (void)category;
++  (void)locale;
++  return (char *)"C";
++}
+diff --git a/boards/arm/stmp3770/hp39gii/src/khicas/khicas_stubs.cpp b/boards/arm/stmp3770/hp39gii/src/khicas/khicas_stubs.cpp
+new file mode 100644
+index 00000000..2309324a
+--- /dev/null
++++ b/boards/arm/stmp3770/hp39gii/src/khicas/khicas_stubs.cpp
+@@ -0,0 +1,181 @@
++/****************************************************************************
++ * boards/arm/stmp3770/hp39gii/src/khicas/khicas_stubs.cpp
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * The giac core in libcas refers to the turtle-graphics commands and to the
++ * xcas UI, which live in the GUI half of KhiCAS (kdisplay.cc, console.cc).
++ * This port does not build that half: the console REPL is our own.  Every
++ * such symbol has to exist for the command table to link, so it is defined
++ * here.  Turtle commands evaluate to undef; the UI entry points do nothing.
++ *
++ ****************************************************************************/
++
++#include <string>
++
++#include "giac.h"
++
++/* -------------------------------------------------------------------------
++ * Turtle commands: giac stores a command as a function pointer cast to a
++ * unary_function_ptr, exactly like define_unary_function_ptr5() does.  All
++ * of them share one stub that returns undef.
++ * ------------------------------------------------------------------------- */
++
++namespace giac
++{
++  static gen turtle_unsupported(const gen &, const context *)
++  {
++    return undef;
++  }
++
++  static const ulonglong turtle_unsupported_fn =
++      (ulonglong) turtle_unsupported;
++
++#define TURTLE_AT(sym) \
++  extern const unary_function_ptr * const sym; \
++  const unary_function_ptr * const sym = \
++      (const unary_function_ptr *) &turtle_unsupported_fn
++
++  TURTLE_AT(at_avance);
++  TURTLE_AT(at_backward);
++  TURTLE_AT(at_baisse_crayon);
++  TURTLE_AT(at_cache_tortue);
++  TURTLE_AT(at_cap);
++  TURTLE_AT(at_clearscreen);
++  TURTLE_AT(at_crayon);
++  TURTLE_AT(at_current_sheet);
++  TURTLE_AT(at_debut_enregistrement);
++  TURTLE_AT(at_dessine_tortue);
++  TURTLE_AT(at_disque);
++  TURTLE_AT(at_disque_centre);
++  TURTLE_AT(at_ecris);
++  TURTLE_AT(at_efface);
++  TURTLE_AT(at_fin_enregistrement);
++  TURTLE_AT(at_forward);
++  TURTLE_AT(at_heading);
++  TURTLE_AT(at_hideturtle);
++  TURTLE_AT(at_jump);
++  TURTLE_AT(at_leve_crayon);
++  TURTLE_AT(at_montre_tortue);
++  TURTLE_AT(at_pas_de_cote);
++  TURTLE_AT(at_pencolor);
++  TURTLE_AT(at_penup);
++  TURTLE_AT(at_polygone_rempli);
++  TURTLE_AT(at_position);
++  TURTLE_AT(at_rectangle_plein);
++  TURTLE_AT(at_recule);
++  TURTLE_AT(at_repete);
++  TURTLE_AT(at_rond);
++  TURTLE_AT(at_saute);
++  TURTLE_AT(at_showturtle);
++  TURTLE_AT(at_signe);
++  TURTLE_AT(at_skip);
++  TURTLE_AT(at_speed);
++  TURTLE_AT(at_tourne_droite);
++  TURTLE_AT(at_tourne_gauche);
++  TURTLE_AT(at_towards);
++  TURTLE_AT(at_triangle_plein);
++  TURTLE_AT(at_turtle_stack);
++  TURTLE_AT(at_vers);
++
++  logo_turtle * turtleptr = nullptr;
++
++  logo_turtle & turtle()
++  {
++    static logo_turtle t;
++    return t;
++  }
++
++  gen turtle_state(const context *)
++  {
++    return undef;
++  }
++
++  gen select_var(const context *)
++  {
++    return undef;
++  }
++
++  gen position(const gen &, const context *)
++  {
++    return undef;
++  }
++
++  gen _position(const gen &, const context *)
++  {
++    return undef;
++  }
++
++  gen _rond(const gen &, const context *)
++  {
++    return undef;
++  }
++
++  gen _ecris(const gen &, const context *)
++  {
++    return undef;
++  }
++
++  gen _efface_logo(const gen &, const context *)
++  {
++    return undef;
++  }
++
++  gen _tourne_droite(const gen &, const context *)
++  {
++    return undef;
++  }
++
++  gen _tourne_gauche(const gen &, const context *)
++  {
++    return undef;
++  }
++
++  int showCatalog(char *, int, int, const context *)
++  {
++    return 0;
++  }
++
++  /* The engine's own line reader; our REPL does not use it. */
++
++  int inputline(const char *, const char *, std::string &, bool, int,
++                const context *)
++  {
++    return -1;
++  }
++}
++
++/* -------------------------------------------------------------------------
++ * xcas UI entry points.
++ * ------------------------------------------------------------------------- */
++
++namespace xcas
++{
++  void dConsolePut(const char *)
++  {
++  }
++
++  void displaylogo()
++  {
++  }
++
++  int console_main(const giac::context *, const char *)
++  {
++    return 0;
++  }
++
++  int displaygraph(const giac::gen &, const giac::gen &, const giac::context *)
++  {
++    return 0;
++  }
++
++  int eqw(const giac::gen &, bool, const giac::context *)
++  {
++    return 0;
++  }
++
++  int textedit(char *, int, bool, const giac::context *, const char *)
++  {
++    return 0;
++  }
++}
+-- 
+2.53.0
+
