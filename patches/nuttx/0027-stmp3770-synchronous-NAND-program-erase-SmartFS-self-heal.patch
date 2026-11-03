@@ -1,0 +1,512 @@
+From cfade36c6ebbb8c12b08554f180f36460d408873 Mon Sep 17 00:00:00 2001
+From: edwardzhu02 <explodingtnt@foxmail.com>
+Date: Tue, 3 Nov 2026 18:01:38 +0800
+Subject: [PATCH] stmp3770: synchronous NAND program/erase, SmartFS self-heal
+
+Programming and erasing returned as soon as the APBH chain had been
+handed to the DMA engine.  The file system writes a sector and reads it
+back immediately, so with the device still busy the next command aborted
+the program: the page stayed erased and every append eventually failed
+(EIO) at whatever sector boundary the timing hit.  Bounding the wait
+keeps a dead device a failed write instead of a hang.
+
+Board side, from the same hardware session:
+- probe the mounted volume with a write/umount/remount/read before
+  trusting it, and reformat when it does not survive that;
+- when the 3.2 MB engine copy fails, unlink the partial file and run
+  from the raw staging area instead of reformatting on every boot;
+- wake the shell from inside the application at exit, not from the
+  thread trampoline (does not fix the quit hang yet -- see the notes).
+---
+ arch/arm/src/stmp3770/stmp3770_gpmi.c         |  31 ++-
+ .../arm/stmp3770/hp39gii/src/hp39gii_boot.c   | 227 +++++++++++++++---
+ .../hp39gii/src/khicas/khicas_app.cpp         |   8 +
+ 3 files changed, 234 insertions(+), 32 deletions(-)
+
+diff --git a/arch/arm/src/stmp3770/stmp3770_gpmi.c b/arch/arm/src/stmp3770/stmp3770_gpmi.c
+index a624dca3..2c4a877a 100644
+--- a/arch/arm/src/stmp3770/stmp3770_gpmi.c
++++ b/arch/arm/src/stmp3770/stmp3770_gpmi.c
+@@ -1244,8 +1244,9 @@ static inline void    GPMI_EraseBlock(uint32_t blockAddress, bool block)
+     BW_APBH_CHn_SEMA_INCREMENT_SEMA(NAND_DMA_Channel, 1); 
+ 
+     if(block){
++        uint32_t _s = 0;
+         while ((HW_APBH_CHn_SEMA(NAND_DMA_Channel).B.INCREMENT_SEMA) && !ECC_FIN)
+-            ;
++            { if (++_s > 5000000u) break; }
+     }
+ 
+     LastEraseTime = HW_DIGCTL_MICROSECONDS_RD();
+@@ -1305,8 +1306,9 @@ static inline void    GPMI_WritePage(uint32_t ColumnAddress, uint32_t RowAddress
+     LastProgTime = HW_DIGCTL_MICROSECONDS_RD();
+ 
+     if(block){
++        uint32_t _s = 0;
+         while ((HW_APBH_CHn_SEMA(NAND_DMA_Channel).B.INCREMENT_SEMA))
+-            ;
++            { if (++_s > 5000000u) break; }
+     }
+ 
+     LastEraseTime = HW_DIGCTL_MICROSECONDS_RD();
+@@ -1622,6 +1624,19 @@ FAR const uint8_t *stmp3770_nand_id(void)
+     return (FAR const uint8_t *)FlashRecCommandBuffer;
+ }
+ 
++/* Programming is synchronous.
++ *
++ * GPMI_WritePage() returns as soon as the command chain has been handed to
++ * the APBH engine; the engine then programs the page and waits for the
++ * device to become ready again (the WAIT_FOR_READY stage in the chain).
++ * Returning early lets the caller -- the file system writes a sector and
++ * immediately reads it back -- issue a command while the device is busy,
++ * which aborts the program: the write is lost and the page stays erased.
++ *
++ * So ask the chain to block until it has finished, and bound the wait so a
++ * stuck device shows up as a failed write instead of a hang.
++ */
++
+ void portMTDReadPage(uint32_t page, uint8_t *buf)
+ {
+     /*
+@@ -1646,14 +1661,14 @@ void portMTDWritePage(uint32_t page, uint8_t *buf)
+ {
+     //NFO("WR:%d\n", page);
+     GPMI_WritePage(0, page, (uint32_t *)stmp3770_va2pa((uint32_t)buf),
+-                   NULL, false);
++                   NULL, true);
+ }
+ 
+ void portMTDWritePageMeta(uint32_t page, uint8_t *buf, uint8_t *metaBuf)
+ {
+     //INFO("WRM:%d\n", page);
+     GPMI_WritePage(0, page, (uint32_t *)stmp3770_va2pa((uint32_t)buf),
+-                   (uint32_t *)(metaBuf ? stmp3770_va2pa((uint32_t)metaBuf) : 0), false);
++                   (uint32_t *)(metaBuf ? stmp3770_va2pa((uint32_t)metaBuf) : 0), true);
+ }
+ 
+ uint8_t *portMTDGetMetaData()
+@@ -1664,7 +1679,13 @@ uint8_t *portMTDGetMetaData()
+ 
+ void portMTDEraseBlock(uint32_t block)
+ {
+-    GPMI_EraseBlock(block, false);
++    /* Blocking for the same reason writes are: the file system erases a
++     * block and immediately programs the first sector in it.  With the
++     * erase still running, the program is dropped -- which shows up as a
++     * write failure exactly when the previous block fills up.
++     */
++
++    GPMI_EraseBlock(block, true);
+ }
+ 
+ void portMTDCopyPage(uint32_t src, uint32_t dst)
+diff --git a/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c b/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c
+index 039d587c..46b959db 100644
+--- a/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c
++++ b/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c
+@@ -264,6 +264,49 @@ static void nand_print_num(FAR const char *tag, uint32_t v)
+   stmp3770_lcdcon_puts(b);
+ }
+ 
++/* SmartFS returns short reads and writes at sector boundaries, so every
++ * transfer has to be looped.
++ */
++
++static bool fs_write_all(int fd, FAR const uint8_t *buf, size_t n)
++{
++  size_t done = 0;
++
++  while (done < n)
++    {
++      ssize_t w = write(fd, buf + done, n - done);
++
++      if (w <= 0)
++        {
++          return false;
++        }
++
++      done += (size_t)w;
++    }
++
++  return true;
++}
++
++static bool fs_read_all(int fd, FAR uint8_t *buf, size_t n)
++{
++  size_t done = 0;
++
++  while (done < n)
++    {
++      ssize_t r = read(fd, buf + done, n - done);
++
++      if (r <= 0)
++        {
++          return false;
++        }
++
++      done += (size_t)r;
++    }
++
++  return true;
++}
++
++
+ /* 原厂在 0 号块和 4 号块各存了一份 NCB（NAND 控制块），两份内容逐字节
+  * 相同。4 号块那份一旦被抹掉，就从 0 号块复制回去（数据 + 19 字节元数据），
+  * 并读回复核。返回 0=本来就正常，1=已修复，负值=修复失败。
+@@ -287,13 +330,29 @@ FAR struct mtd_dev_s *hp39gii_nand_mtd(void)
+ 
+ #ifdef CONFIG_STMP3770_KHICAS
+ static sem_t g_khicas_done;
++static bool  g_khicas_notified;
++
++/* Waking NSH from the tail of the application itself, not from the thread
++ * trampoline, removes one return path from the sequence: the console only
++ * comes back when this runs, and the engine is not a place to leave anything
++ * to a return address.
++ */
++
++void hp39gii_khicas_notify(void)
++{
++  if (!g_khicas_notified)
++    {
++      g_khicas_notified = true;
++      nxsem_post(&g_khicas_done);
++    }
++}
+ 
+ static int khicas_thread(int argc, FAR char **argv)
+ {
+   extern int khicas_main(int argc, char **argv);
+ 
+   khicas_main(argc, argv);
+-  nxsem_post(&g_khicas_done);
++  hp39gii_khicas_notify();
+   return 0;
+ }
+ 
+@@ -302,6 +361,7 @@ int hp39gii_khicas_run(int argc, FAR char **argv)
+   int pid;
+ 
+   nxsem_init(&g_khicas_done, 0, 0);
++  g_khicas_notified = false;
+   pid = kthread_create("khicas", SCHED_PRIORITY_DEFAULT, 16384,
+                        khicas_thread, NULL);
+   if (pid < 0)
+@@ -441,7 +501,7 @@ static int nand_fs_test(void)
+     }
+ 
+   len = snprintf(buf, sizeof(buf), "%d\n", val);
+-  n = write(fd, buf, len);
++  n = fs_write_all(fd, (FAR const uint8_t *)buf, len) ? len : -1;
+   close(fd);
+   if (n != len)
+     {
+@@ -486,7 +546,7 @@ static int nand_fs_test(void)
+  * and erases the staging copy, after which the file is the master.
+  */
+ 
+-static void nand_install_khicas(FAR struct mtd_dev_s *mtd)
++static int nand_install_khicas(FAR struct mtd_dev_s *mtd)
+ {
+ #ifdef CONFIG_STMP3770_KHICAS
+   extern char _spgtext[];
+@@ -502,20 +562,28 @@ static void nand_install_khicas(FAR struct mtd_dev_s *mtd)
+ 
+   if (size == 0)
+     {
+-      return;
++      return OK;
++    }
++
++  /* A file of the wrong size is a copy that never finished.  Remove it
++   * rather than opening it with O_TRUNC: truncating a chain that was written
++   * while the NAND write path was broken is exactly what fails with EIO.
++   */
++
++  if (stat("/mnt/khicas.bin", &st) == 0 && (uint32_t)st.st_size != size)
++    {
++      unlink("/mnt/khicas.bin");
+     }
+ 
+-  if (stat("/mnt/khicas.bin", &st) != 0 ||
+-      (uint32_t)st.st_size != size)
++  if (stat("/mnt/khicas.bin", &st) != 0 || (uint32_t)st.st_size != size)
+     {
+-      /* Freshly flashed unit: the engine is sitting in the raw staging area
+-       * and there is no file yet (or the file is stale).  Publish it.
++      /* No engine file yet: publish the staging area as one.
+        */
+ 
+       if (hp39gii_nand_blob_state(HP39GII_NAND_BLOB_FIRST) != 1)
+         {
+           nand_put("khicas app MISSING");
+-          return;
++          return -ENOENT;
+         }
+ 
+       nand_put("installing khicas...");
+@@ -525,7 +593,7 @@ static void nand_install_khicas(FAR struct mtd_dev_s *mtd)
+         {
+           nand_put("khicas app OPEN FAILED");
+           nand_print_num("errno ", (uint32_t)errno);
+-          return;
++          return -EIO;
+         }
+ 
+       for (off = 0; (uint32_t)off < size; off += sizeof(rbuf))
+@@ -535,31 +603,48 @@ static void nand_install_khicas(FAR struct mtd_dev_s *mtd)
+           off_t  src = (off_t)HP39GII_NAND_BLOB_FIRST *
+                        HP39GII_NAND_PAGES_PBLK * HP39GII_NAND_PAGE_SIZE + off;
+ 
++          if (((uint32_t)off % 262144) == 0)
++            {
++              stmp3770_lcdcon_puts(".");
++            }
++
+           if (mtd->read(mtd, src, n, rbuf) != (ssize_t)n ||
+-              write(fd, rbuf, n) != (ssize_t)n)
++              !fs_write_all(fd, rbuf, n))
+             {
+               close(fd);
+-              nand_put("khicas app COPY FAILED");
+-              return;
++
++              /* The engine is still in the raw staging area, and that is
++               * what the pager reads; the file is only a copy the user can
++               * see and replace.  Do not let a failed copy take the file
++               * system down with it -- drop the partial file and run from
++               * the staging area.
++               */
++
++              unlink("/mnt/khicas.bin");
++              nand_print_num("khicas file copy at ", (uint32_t)off);
++              nand_print_num("errno ", (uint32_t)errno);
++              nand_put("khicas: raw staging");
++              return OK;
+             }
+         }
+ 
+       close(fd);
+       nand_put("khicas app installed");
+-      return;
++      return OK;
+     }
+ 
+   /* The file exists and has the right size.  The pager cannot read through
+-   * the file system from inside an abort handler (the VFS is not reentrant
+-   * that way), so keep the staging copy in sync with the file and page from
+-   * there.  A unit that never touches the file pays one memcmp per boot.
++   * the file system from inside an abort handler, so keep the staging copy
++   * in sync with the file and page from there.  A unit that never touches
++   * the file pays one compare per boot.
+    */
+ 
+   fd = open("/mnt/khicas.bin", O_RDONLY);
+   if (fd < 0)
+     {
+       nand_put("khicas app OPEN FAILED");
+-      return;
++      nand_print_num("errno ", (uint32_t)errno);
++      return -EIO;
+     }
+ 
+   same = 1;
+@@ -570,7 +655,7 @@ static void nand_install_khicas(FAR struct mtd_dev_s *mtd)
+       off_t  dst = (off_t)HP39GII_NAND_BLOB_FIRST *
+                    HP39GII_NAND_PAGES_PBLK * HP39GII_NAND_PAGE_SIZE + off;
+ 
+-      if (read(fd, fbuf, n) != (ssize_t)n ||
++      if (!fs_read_all(fd, fbuf, n) ||
+           mtd->read(mtd, dst, n, rbuf) != (ssize_t)n ||
+           memcmp(fbuf, rbuf, n) != 0)
+         {
+@@ -584,7 +669,7 @@ static void nand_install_khicas(FAR struct mtd_dev_s *mtd)
+   if (same)
+     {
+       nand_put("khicas app OK");
+-      return;
++      return OK;
+     }
+ 
+   /* Stage the file into the raw area the pager reads. */
+@@ -599,7 +684,7 @@ static void nand_install_khicas(FAR struct mtd_dev_s *mtd)
+   if (fd < 0)
+     {
+       nand_put("khicas app OPEN FAILED");
+-      return;
++      return -EIO;
+     }
+ 
+   for (off = 0; (uint32_t)off < size; off += HP39GII_NAND_PAGE_SIZE)
+@@ -610,22 +695,73 @@ static void nand_install_khicas(FAR struct mtd_dev_s *mtd)
+                    HP39GII_NAND_PAGES_PBLK + (off / HP39GII_NAND_PAGE_SIZE);
+ 
+       memset(fbuf, 0xff, HP39GII_NAND_PAGE_SIZE);
+-      if (read(fd, fbuf, n) != (ssize_t)n ||
+-          mtd->bwrite(mtd, dst, 1, fbuf) != 1)
++      if (!fs_read_all(fd, fbuf, n) || mtd->bwrite(mtd, dst, 1, fbuf) != 1)
+         {
+           close(fd);
+           nand_put("khicas app STAGE FAILED");
+-          return;
++          nand_print_num("at ", (uint32_t)off);
++          return -EIO;
+         }
+     }
+ 
+   close(fd);
+   nand_put("khicas app staged");
++  return OK;
+ #else
+   (void)mtd;
++  return OK;
+ #endif
+ }
+ 
++/* Return true if the mounted volume can be written and the data survives a
++ * remount.
++ *
++ * A volume can mount and still drop every write: a format from a firmware
++ * whose partition started at a different block leaves the root directory
++ * sector where this build cannot see it, so the mount succeeds and every
++ * file operation fails afterwards.  Probing for a real write, with a remount
++ * to defeat the caches, is what tells the two apart.
++ */
++
++static bool hp39gii_fs_probe(void)
++{
++  static const char probe[] = "probe\n";
++  char buf[8];
++  int fd;
++    bool ok = false;
++
++  fd = open("/mnt/.probe", O_WRONLY | O_CREAT | O_TRUNC);
++  if (fd < 0)
++    {
++      return false;
++    }
++
++  ok = fs_write_all(fd, (FAR const uint8_t *)probe, sizeof(probe) - 1);
++  close(fd);
++
++  if (!ok)
++    {
++      return false;
++    }
++
++  umount("/mnt");
++  if (mount("/dev/smart0", "/mnt", "smartfs", 0, NULL) < 0)
++    {
++      return false;
++    }
++
++  fd = open("/mnt/.probe", O_RDONLY);
++  if (fd >= 0)
++    {
++      ok = fs_read_all(fd, (FAR uint8_t *)buf, sizeof(probe) - 1) &&
++           memcmp(buf, probe, sizeof(probe) - 1) == 0;
++      close(fd);
++      unlink("/mnt/.probe");
++    }
++
++  return ok;
++}
++
+ static int hp39gii_nand_thread(int argc, char **argv)
+ {
+   FAR struct mtd_dev_s *mtd;
+@@ -745,9 +881,21 @@ static int hp39gii_nand_thread(int argc, char **argv)
+ 
+   mkdir("/mnt", 0777);
+   ret = mount("/dev/smart0", "/mnt", "smartfs", 0, NULL);
++
++  /* Mounted but not writable means a leftover volume from another layout or
++   * an interrupted format; either way the answer is to start over.
++   */
++
++  if (ret >= 0 && !hp39gii_fs_probe())
++    {
++      nand_put("fs not writable, reformatting");
++      umount("/mnt");
++      ret = -1;
++    }
++
+   if (ret < 0)
+     {
+-      /* First boot after a flash: the volume has never been formatted.
++      /* First boot after a flash, or a volume that had to be thrown away.
+        * Format it here instead of asking the user to type mksmartfs.
+        */
+ 
+@@ -769,14 +917,39 @@ static int hp39gii_nand_thread(int argc, char **argv)
+           return 0;
+         }
+ 
+-      nand_put("formatted, mounted /mnt");
++      /* Confirm the new volume really takes writes before going on. */
++
++      if (hp39gii_fs_probe())
++        {
++          nand_put("formatted, mounted /mnt");
++        }
++      else
++        {
++          nand_put("formatted, WRITE PROBE FAILED");
++        }
+     }
+   else
+     {
+       nand_put("mounted /mnt");
+     }
+ 
+-  nand_install_khicas(mtd);
++  ret = nand_install_khicas(mtd);
++  if (ret < 0)
++    {
++      /* The engine file, or the directory it lives in, is damaged beyond
++       * repair.  The volume only holds the app and a boot counter, so
++       * starting it over is cheaper than trying to patch it.
++       */
++
++      nand_put("fs repair: reformat");
++      umount("/mnt");
++
++      if (mksmartfs("/dev/smart0", 0) == OK &&
++          mount("/dev/smart0", "/mnt", "smartfs", 0, NULL) == OK)
++        {
++          nand_install_khicas(mtd);
++        }
++    }
+ 
+   ret = nand_fs_test();
+   if (ret > 0)
+diff --git a/boards/arm/stmp3770/hp39gii/src/khicas/khicas_app.cpp b/boards/arm/stmp3770/hp39gii/src/khicas/khicas_app.cpp
+index 60d4a682..6ded88c5 100644
+--- a/boards/arm/stmp3770/hp39gii/src/khicas/khicas_app.cpp
++++ b/boards/arm/stmp3770/hp39gii/src/khicas/khicas_app.cpp
+@@ -42,6 +42,7 @@ extern "C" void stmp3770_pager_setblob(uint32_t block);
+  */
+ 
+ extern "C" int hp39gii_nand_blob_state(uint32_t block);
++extern "C" void hp39gii_khicas_notify(void);
+ extern "C" int usleep(unsigned int usec);
+ 
+ #define KHICAS_BLOB_BLOCK 800
+@@ -379,5 +380,12 @@ extern "C" int khicas_main(int argc, char **argv)
+   close(fd);
+   delete ctx;
+   outln("bye");
++
++  /* Hand the console back to the shell before returning: the caller waits on
++   * this, and the return path out of a 3 MB paged engine is a poor place to
++   * depend on.
++   */
++
++  hp39gii_khicas_notify();
+   return 0;
+ }
+-- 
+2.53.0
+

@@ -169,6 +169,20 @@ a 64-byte ring buffer with a counting semaphore, and `read()` blocks on it. The
 device is registered in `board_late_initialize()` before the keyboard can inject,
 otherwise the semaphore is used uninitialised.
 
+## KhiCAS
+
+**`quit` prints `bye` and the console never comes back.**
+The shell is blocked in `nxsem_wait()` on the semaphore that
+`hp39gii_khicas_run()` waits for; scrolling still works because that is the
+keyboard thread redrawing the console, not the shell. Posting the semaphore
+from the app after `bye` does not help, which means the app never gets that
+far: the stall is in the console write that draws `bye`. See
+[khicas.md §7.4](khicas.md#74-on-real-hardware).
+
+**`khicas` starts and then aborts in a C++ constructor at `0xFFFF_FFFF`.**
+`nuttx.bin` and `khicas.bin` are from different builds. Flash both from the
+same build; they are an image pair.
+
 ## Menu
 
 **Selecting NuttX resets back into the menu.**

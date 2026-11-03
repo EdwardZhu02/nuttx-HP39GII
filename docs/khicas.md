@@ -409,9 +409,49 @@ Then on the calculator: `cd /mnt` shows `khicas.bin`, and `khicas` runs it.
 ![KhiCAS running in EmuGII](khicas-emugii.png)
 
 **Verified in EmuGII**, through the real boot chain (menu firmware at `0x50000` ->
-NuttX from NAND block 243 -> auto-format SmartFS -> install the engine -> `khicas`).
-Not yet run on hardware: the 39gII has no exposed console, so the first real-hardware
-sign of life is `khicas` printing `CAS> ` on the panel.
+NuttX from NAND block 243 -> auto-format SmartFS -> install the engine -> `khicas`),
+and on real hardware since — see §7.4 for what hardware changed and what is
+still open.
+
+### 7.4 On real hardware
+
+`nuttx.bin` and `khicas.bin` are one image pair, and flashing one without the
+other is how the emulator got broken: the engine links against the kernel's
+resident addresses, so every build produces a new `khicas.bin` even when its
+size is unchanged, and the board only re-stages `/mnt/khicas.bin` when the
+*size* differs. A new `nuttx.bin` over an old blob runs new resident code
+against an old engine and dies in the C++ locale constructors, dereferencing
+`0xFFFF_FFFF`.
+
+With a matching pair, the first boots on hardware went: menu -> NuttX (panel
+log, `/mnt` mounts) -> `mksmartfs` of the 553-block volume -> engine install
+(`installing khicas......`) -> `boot# 1`, `boot# 2` on the next boot -> `khicas`
+and `2+2` -> `4`.
+
+Getting that far took patch 0027. `GPMI_WritePage()` and `GPMI_EraseBlock()`
+returned as soon as the APBH chain had been queued, so the file system wrote a
+sector and read it straight back while the device was still programming
+(`tPROG` up to 700 us). The read aborted the program, the page stayed erased,
+and the next append failed with `EIO` wherever the timing happened to land --
+always a block boundary, never the same one twice. Both now block until the
+chain reports done, bounded so a dead device fails the write instead of
+hanging the boot. The board also probes the volume with a write / umount /
+remount / read before trusting it, and if the 3.2 MB engine copy fails anyway
+it unlinks the partial file and runs from the raw staging area rather than
+reformatting on every boot.
+
+**Still open: `quit` does not return to the shell.** `bye` prints, the panel
+keeps working (up/down still scroll the console -- that is the keyboard thread
+redrawing, not the shell), there is no `nsh>`, and keystrokes are not echoed:
+the shell is still inside `nxsem_wait()` in `hp39gii_khicas_run()`. Posting
+that semaphore from the application itself, after `bye` and before returning,
+did not change it. That moves the stall earlier -- execution never reaches the
+statement after `outln("bye")`, so the block is inside the console write
+(`stmp3770_lcdcon_puts()` -> `portDispFlushAreaBuf()`), not in the thread's
+return path. Next attempts, in order: post before `outln("bye")`, which
+localises it to one statement; if the prompt comes back, either make that flush
+non-blocking or run the CAS in a persistent thread that never exits and leave
+the shell's wait with a timeout.
 
 ## 8. What is reusable from ExistOS, verbatim
 

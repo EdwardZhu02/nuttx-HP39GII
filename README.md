@@ -13,7 +13,7 @@ Three things are built here:
 
 | Component | What it is | Where it runs |
 |---|---|---|
-| **NuttX port** | `arch/arm/src/stmp3770` + `boards/arm/stmp3770/hp39gii` — 26 patch commits on top of Apache NuttX | calculator (after the menu hands over) |
+| **NuttX port** | `arch/arm/src/stmp3770` + `boards/arm/stmp3770/hp39gii` — 27 patch commits on top of Apache NuttX | calculator (after the menu hands over) |
 | **Boot menu** | an OSLoader variant of [ExistOS](https://github.com/ExistOS-Team/ExistOS-For-HP39GII) that loads NuttX from NAND and offers the stock system as a (disabled) second entry | calculator, loaded by the boot ROM |
 | **Recovery firmware** | `nandrestore` / `nanddump` / `probe`: RAM-only firmware that talks to a host over USB CDC | calculator, loaded by the boot ROM over USB |
 
@@ -40,7 +40,7 @@ Verified on real hardware unless marked otherwise.
 | USB device (CDC-ACM) under NuttX | ❌ not implemented |
 | LCD framebuffer / graphics beyond the 32×16 text console | ❌ not implemented |
 | On-demand paging (3.75 MB window over NAND) | ✅ works — 16 frames of 4 KB, filled from NAND inside the abort handler; see [docs/khicas.md](docs/khicas.md) |
-| KhiCAS (Giac/Xcas) | ✅ works in EmuGII — `khicas` starts the CAS console; 3.2 MB of Thumb code paged from `/mnt/khicas.bin`, `2+2` → `4`, `integrate(x^2,x)` → `x**3/3`. Not yet run on hardware; see [docs/khicas.md](docs/khicas.md) |
+| KhiCAS (Giac/Xcas) | ✅ runs on hardware — `khicas` starts the CAS console and `2+2` → `4`, with 3.2 MB of Thumb code paged out of NAND. `quit` prints `bye` but does not give the `nsh>` prompt back yet; see [docs/khicas.md](docs/khicas.md#74-on-real-hardware) |
 | Linux on this device | ❌ impossible — 512 KB of RAM, see [docs/hardware.md](docs/hardware.md#there-is-no-dram) |
 
 NuttX uses about 274 KB of the 512 KB SRAM (53 %). Of the rest, 80 KB is the paged
@@ -101,6 +101,9 @@ python3 host-tools/install_menu.py --ldlb --backup-data nand-full.data \
         --backup-oob nand-full.oob
 ```
 
+`nuttx.bin` and `khicas.bin` are one image pair — always flash both from the same
+build (see [docs/flashing.md](docs/flashing.md#step-1--install-the-menu-and-nuttx)).
+
 Power-cycle: the menu appears, press **DOWN** then **ENTER** (entry 1, "HP OS", is
 selected by default and is not available).
 
@@ -114,7 +117,7 @@ python3 host-tools/install_menu.py --restore-ldlb --backup-data nand-full.data \
 ## Repository layout
 
 ```
-patches/nuttx/     26 patches: the SoC port + board support, against a pinned NuttX
+patches/nuttx/     27 patches: the SoC port + board support, against a pinned NuttX
 patches/apps/       2 patches: the nshlib "clear" and "khicas" commands
 patches/existos/    3 patches: the NAND dump/restore firmware and the boot menu
 scripts/            fetch, configure, build, package (see docs/building.md)

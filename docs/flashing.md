@@ -81,7 +81,12 @@ khicas: 1562 pages -> blocks 800..824
 ```
 
 `--khicas` is optional. Without it NuttX still boots; `khicas` then reports
-that the engine is missing. On the first boot NuttX copies those blocks to
+that the engine is missing. It is not optional when you reflash the kernel,
+though: `nuttx.bin` and `khicas.bin` are one image pair. The engine is linked
+against resident addresses and its content changes with every build even when
+its size does not, while the board re-stages `/mnt/khicas.bin` only when the
+size changes -- a new kernel over an old engine boots and then dies inside the
+CAS. Flash both, from the same build. On the first boot NuttX copies those blocks to
 `/mnt/khicas.bin` (the panel shows `installing khicas...` for a few seconds);
 after that the pager reads the engine out of the raw blocks, re-staging them
 from the file whenever the file changes.

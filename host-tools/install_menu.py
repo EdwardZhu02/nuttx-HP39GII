@@ -231,7 +231,7 @@ def main():
 
     p = connect(path)
 
-    if args.khicas:
+    def write_khicas():
         blob = open(args.khicas, "rb").read()
         maxlen = KHICAS_BLOCKS * PPB * PAGE
         if len(blob) > maxlen:
@@ -241,6 +241,10 @@ def main():
             blob += b"\xff" * (PAGE - len(blob) % PAGE)
         pages = [blob[i:i + PAGE] for i in range(0, len(blob), PAGE)]
         write_area(p, KHICAS_FIRST_BLOCK, pages, "khicas", args.delay)
+
+    # --khicas on its own
+    if args.khicas and not (args.images or args.ldlb or args.restore_ldlb):
+        write_khicas()
         p.write(MAGIC_E)
         p.close()
         return
@@ -281,6 +285,10 @@ def main():
             write_area(p, HP_BLOCK, hp_pages, "hp script", args.delay)
         if args.only in (None, "nuttx"):
             write_area(p, NX_BLOCK, nx_pages, "nuttx image", args.delay)
+        # Kernel and engine are one image pair; write both from one command
+        # so they cannot come from different builds.
+        if args.khicas:
+            write_khicas()
         print("menu pages: %d" % len(menu_pages))
         p.write(MAGIC_E)
         p.close()
