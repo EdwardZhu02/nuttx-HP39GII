@@ -375,7 +375,7 @@ The pager reads from the raw area only: a file system read from inside an abort 
 works just often enough to be a trap (it corrupts the heap), and `NAND` reads there are
 two page reads instead of eight sector reads.
 
-**Three things had to be fixed before real code survived paging**, all in patch 0026:
+**Three things had to be fixed before real code survived paging**, all in patch 0028:
 
 * The frame reverse map was never initialised. For the first 16 faults the frames are
   free, so a forward sweep (the self-test) passes; real code revisits pages, and from
@@ -428,7 +428,7 @@ log, `/mnt` mounts) -> `mksmartfs` of the 553-block volume -> engine install
 (`installing khicas......`) -> `boot# 1`, `boot# 2` on the next boot -> `khicas`
 and `2+2` -> `4`.
 
-Getting that far took patch 0027. `GPMI_WritePage()` and `GPMI_EraseBlock()`
+Getting that far took patch 0029. `GPMI_WritePage()` and `GPMI_EraseBlock()`
 returned as soon as the APBH chain had been queued, so the file system wrote a
 sector and read it straight back while the device was still programming
 (`tPROG` up to 700 us). The read aborted the program, the page stayed erased,

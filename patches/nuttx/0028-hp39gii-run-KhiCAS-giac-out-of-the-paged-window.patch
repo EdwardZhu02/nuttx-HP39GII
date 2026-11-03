@@ -1,4 +1,4 @@
-From 72f277a85af5d71f03c5682c5bdec0101ff5f8b3 Mon Sep 17 00:00:00 2001
+From e486b5b14e0ed22816e7374288c8243239c7960d Mon Sep 17 00:00:00 2001
 From: edwardzhu02 <explodingtnt@foxmail.com>
 Date: Tue, 3 Nov 2026 15:06:47 +0800
 Subject: [PATCH] hp39gii: run KhiCAS (giac) out of the paged window
@@ -48,7 +48,7 @@ on in the board defconfig.
  arch/arm/src/stmp3770/Kconfig                 |   9 +
  arch/arm/src/stmp3770/Make.defs               |  18 +
  arch/arm/src/stmp3770/stmp3770_allocateheap.c |   9 +-
- arch/arm/src/stmp3770/stmp3770_boot.c         |  44 +-
+ arch/arm/src/stmp3770/stmp3770_boot.c         |  80 ++--
  arch/arm/src/stmp3770/stmp3770_gpmi.c         |  33 ++
  arch/arm/src/stmp3770/stmp3770_memorymap.h    |  51 ++-
  arch/arm/src/stmp3770/stmp3770_pager.c        |  51 ++-
@@ -59,7 +59,7 @@ on in the board defconfig.
  .../hp39gii/src/khicas/khicas_app.cpp         | 383 ++++++++++++++++++
  .../hp39gii/src/khicas/khicas_compat.c        | 104 +++++
  .../hp39gii/src/khicas/khicas_stubs.cpp       | 181 +++++++++
- 14 files changed, 1095 insertions(+), 89 deletions(-)
+ 14 files changed, 1129 insertions(+), 91 deletions(-)
  create mode 100644 boards/arm/stmp3770/hp39gii/src/khicas/khicas_app.cpp
  create mode 100644 boards/arm/stmp3770/hp39gii/src/khicas/khicas_compat.c
  create mode 100644 boards/arm/stmp3770/hp39gii/src/khicas/khicas_stubs.cpp
@@ -134,7 +134,7 @@ index e15d5508..b78a06d6 100644
    DEBUGASSERT(*heap_size > 0);
  }
 diff --git a/arch/arm/src/stmp3770/stmp3770_boot.c b/arch/arm/src/stmp3770/stmp3770_boot.c
-index 7c99aa8a..b5f723d4 100644
+index 7c99aa8a..37236163 100644
 --- a/arch/arm/src/stmp3770/stmp3770_boot.c
 +++ b/arch/arm/src/stmp3770/stmp3770_boot.c
 @@ -72,46 +72,24 @@
@@ -207,6 +207,56 @@ index 7c99aa8a..b5f723d4 100644
  #endif
    l1[STMP3770_REGS_BASE >> 20] =
        (STMP3770_REGS_BASE & 0xfff00000) | MMU_IOFLAGS;
+@@ -207,8 +185,26 @@ static void stmp3770_mmuinit(void)
+ uint32_t stmp3770_va2pa(uint32_t va)
+ {
+ #ifdef CONFIG_STMP3770_PAGING
+-  uint32_t *l1 = (uint32_t *)PGTABLE_BASE_VADDR;
+-  uint32_t  d1 = l1[va >> 20];
++  uint32_t *l1;
++  uint32_t  d1;
++  uint32_t  cr;
++
++  /* Only the MMU can make a virtual address differ from its physical one.
++   * The LCD is brought up before stmp3770_mmuinit(), and both the LCDIF and
++   * the GPMI hand these pointers to the APBH engine, so this gets called
++   * with the MMU off and a page table that is still whatever the boot menu
++   * left at 0x7C000 -- which on hardware is not zero, and reads back as
++   * plausible descriptors.  Return the address unchanged in that case.
++   */
++
++  __asm volatile ("mrc p15, 0, %0, c1, c0, 0" : "=r" (cr));
++  if ((cr & 1) == 0)
++    {
++      return va;
++    }
++
++  l1 = (uint32_t *)PGTABLE_BASE_VADDR;
++  d1 = l1[va >> 20];
+ 
+   if ((d1 & 3) == PMD_TYPE_COARSE)
+     {
+@@ -365,6 +361,20 @@ static void stmp3770_lcd_fill_bottom_black(void)
+ 
+ void arm_boot(void)
+ {
++  /* The boot menu ran from this SRAM and left its heap behind; the page
++   * table lives in that footprint and nothing has cleared it yet.
++   */
++
++  {
++    uint32_t *l1 = (uint32_t *)PGTABLE_BASE_VADDR;
++    int i;
++
++    for (i = 0; i < (int)(PGTABLE_SIZE / sizeof(uint32_t)); i++)
++      {
++        l1[i] = 0;
++      }
++  }
++
+   stmp3770_setupmappings();
+ 
+   /* 早期点亮面板（BootROM 时钟下，真机唯一可见反馈）。marker 会置
 diff --git a/arch/arm/src/stmp3770/stmp3770_gpmi.c b/arch/arm/src/stmp3770/stmp3770_gpmi.c
 index 89c7e413..a624dca3 100644
 --- a/arch/arm/src/stmp3770/stmp3770_gpmi.c

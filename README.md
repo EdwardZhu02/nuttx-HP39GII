@@ -13,7 +13,7 @@ Three things are built here:
 
 | Component | What it is | Where it runs |
 |---|---|---|
-| **NuttX port** | `arch/arm/src/stmp3770` + `boards/arm/stmp3770/hp39gii` — 27 patch commits on top of Apache NuttX | calculator (after the menu hands over) |
+| **NuttX port** | `arch/arm/src/stmp3770` + `boards/arm/stmp3770/hp39gii` — 29 patch commits on top of Apache NuttX | calculator (after the menu hands over) |
 | **Boot menu** | an OSLoader variant of [ExistOS](https://github.com/ExistOS-Team/ExistOS-For-HP39GII) that loads NuttX from NAND and offers the stock system as a (disabled) second entry | calculator, loaded by the boot ROM |
 | **Recovery firmware** | `nandrestore` / `nanddump` / `probe`: RAM-only firmware that talks to a host over USB CDC | calculator, loaded by the boot ROM over USB |
 
@@ -117,7 +117,7 @@ python3 host-tools/install_menu.py --restore-ldlb --backup-data nand-full.data \
 ## Repository layout
 
 ```
-patches/nuttx/     27 patches: the SoC port + board support, against a pinned NuttX
+patches/nuttx/     29 patches: the SoC port + board support, against a pinned NuttX
 patches/apps/       2 patches: the nshlib "clear" and "khicas" commands
 patches/existos/    3 patches: the NAND dump/restore firmware and the boot menu
 scripts/            fetch, configure, build, package (see docs/building.md)

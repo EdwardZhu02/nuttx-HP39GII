@@ -1,0 +1,326 @@
+From 4c143d0975368324cce6d25f28c7afc82c7bde87 Mon Sep 17 00:00:00 2001
+From: edwardzhu02 <explodingtnt@foxmail.com>
+Date: Tue, 3 Nov 2026 13:28:16 +0800
+Subject: [PATCH] hp39gii: auto-format SmartFS, SHIFT+ON power off, GPMI DMA
+ translation
+
+Three things that the paging layout broke or that the install flow needed:
+
+  - The GPMI DMA had the same virtual/physical bug as the LCD: SmartFS
+    hands down heap sector buffers, and with paging those live in the
+    remapped data region, so every read landed at the alias of the
+    pointer.  portMTDReadPage/WritePage/WritePageMeta translate now, and
+    bread bounces through a 32-byte aligned static page buffer (the DMA
+    also needs that alignment on hardware, and bwrite already did it).
+    Symptom was a freshly formatted volume where files could be written
+    but never reopened (EIO) and the directory listed empty.
+
+  - The NAND thread formats the volume itself when mount fails, instead
+    of printing run: mksmartfs /dev/smart0 and leaving the user with an
+    unusable /mnt.
+
+  - SHIFT+ON/C powers the calculator off: flush, unmount /mnt, then the
+    STMP3770 PMIC sequence (unlock 0x3E77, PWD_OFF, PWD) and halt.  The
+    same code is exported as board_power_off(), enabled through
+    CONFIG_BOARDCTL_POWEROFF so the NSH poweroff command works too.
+
+Verified in EmuGII (paging on, blank NAND): formats, mounts, the
+boot.txt read-back test reports boot# 1, and the console stays live.
+---
+ arch/arm/src/stmp3770/stmp3770.h              |   1 +
+ arch/arm/src/stmp3770/stmp3770_gpmi.c         |  16 ++-
+ arch/arm/src/stmp3770/stmp3770_mtd.c          |  17 ++-
+ .../arm/stmp3770/hp39gii/src/hp39gii_boot.c   | 109 +++++++++++++++++-
+ boards/arm/stmp3770/hp39gii/src/hp39gii_kbd.c |  20 ++++
+ 5 files changed, 152 insertions(+), 11 deletions(-)
+
+diff --git a/arch/arm/src/stmp3770/stmp3770.h b/arch/arm/src/stmp3770/stmp3770.h
+index e41f7291..396cf97e 100644
+--- a/arch/arm/src/stmp3770/stmp3770.h
++++ b/arch/arm/src/stmp3770/stmp3770.h
+@@ -32,6 +32,7 @@
+ 
+ void stmp3770_boardinitialize(void);
+ void stmp3770_powerconfig(void);
++uint32_t stmp3770_va2pa(uint32_t va);
+ int stmp3770_lcd_hw_ready(void);
+ void stmp3770_stage(int n);
+ 
+diff --git a/arch/arm/src/stmp3770/stmp3770_gpmi.c b/arch/arm/src/stmp3770/stmp3770_gpmi.c
+index d46944cd..89c7e413 100644
+--- a/arch/arm/src/stmp3770/stmp3770_gpmi.c
++++ b/arch/arm/src/stmp3770/stmp3770_gpmi.c
+@@ -1,4 +1,6 @@
+ #include "mtd_up.h"
++
++#include "stmp3770.h"
+ #include "interrupt_up.h"
+ 
+ #include "regsclkctrl.h"
+@@ -1596,7 +1598,13 @@ void portMTDReadPage(uint32_t page, uint8_t *buf)
+         return;
+     }*/
+     
+-    GPMI_ReadPage(0, page, (uint32_t *)buf, NULL, false);
++    /* The APBH engine addresses memory physically: buffers handed down from
++     * SmartFS live on the heap, which on-demand paging backs with a different
++     * physical range.  Translate before the DMA sees the pointer.
++     */
++
++    GPMI_ReadPage(0, page, (uint32_t *)stmp3770_va2pa((uint32_t)buf),
++                  NULL, false);
+ 
+     //lastRDPage = page;
+ }
+@@ -1604,13 +1612,15 @@ void portMTDReadPage(uint32_t page, uint8_t *buf)
+ void portMTDWritePage(uint32_t page, uint8_t *buf)
+ {
+     //NFO("WR:%d\n", page);
+-    GPMI_WritePage(0, page, (uint32_t *)buf, NULL, false);
++    GPMI_WritePage(0, page, (uint32_t *)stmp3770_va2pa((uint32_t)buf),
++                   NULL, false);
+ }
+ 
+ void portMTDWritePageMeta(uint32_t page, uint8_t *buf, uint8_t *metaBuf)
+ {
+     //INFO("WRM:%d\n", page);
+-    GPMI_WritePage(0, page, (uint32_t *)buf, (uint32_t *)metaBuf, false);
++    GPMI_WritePage(0, page, (uint32_t *)stmp3770_va2pa((uint32_t)buf),
++                   (uint32_t *)(metaBuf ? stmp3770_va2pa((uint32_t)metaBuf) : 0), false);
+ }
+ 
+ uint8_t *portMTDGetMetaData()
+diff --git a/arch/arm/src/stmp3770/stmp3770_mtd.c b/arch/arm/src/stmp3770/stmp3770_mtd.c
+index 4ad3203c..2e1655ea 100644
+--- a/arch/arm/src/stmp3770/stmp3770_mtd.c
++++ b/arch/arm/src/stmp3770/stmp3770_mtd.c
+@@ -46,12 +46,25 @@ static ssize_t stmp3770_mtd_bread(FAR struct mtd_dev_s *dev, off_t startblock,
+ {
+   FAR struct stmp3770_mtd_dev_s *priv =
+       (FAR struct stmp3770_mtd_dev_s *)dev;
++
++  /* The GPMI DMA needs a 32-byte aligned destination.  Upper layers (SmartFS
++   * sector buffers, for one) do not promise that, so bounce through a static
++   * page buffer, the same way bwrite() does.
++   */
++
++  static uint8_t rbuf[2048] __attribute__((aligned(32)));
+   size_t i;
+ 
++  if (priv->info.PageSize_B > sizeof(rbuf))
++    {
++      return -EINVAL;
++    }
++
+   for (i = 0; i < nblocks; i++)
+     {
+-      portMTDReadPage((uint32_t)(startblock + i),
+-                      buffer + i * priv->info.PageSize_B);
++      portMTDReadPage((uint32_t)(startblock + i), rbuf);
++      memcpy(buffer + i * priv->info.PageSize_B, rbuf,
++             priv->info.PageSize_B);
+     }
+ 
+   return (ssize_t)nblocks;
+diff --git a/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c b/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c
+index 9ccdc925..43f834be 100644
+--- a/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c
++++ b/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c
+@@ -161,12 +161,23 @@ static int hp39gii_lcd_thread(int argc, char **argv)
+ #include <nuttx/fs/smart.h>
+ #include <stdlib.h>
+ #include <sys/mount.h>
++
++/* From apps/fsutils/mksmartfs, linked into the kernel image (CONFIG_FSUTILS_MKSMARTFS). */
++extern int mksmartfs(FAR const char *pathname, uint16_t sectorsize);
+ #include <sys/stat.h>
+ #include <string.h>
+ #include <sys/ioctl.h>
+ #include <fcntl.h>
+ #include <errno.h>
+ 
++#include "hw/regspower.h"
++#include "hw/regs.h"
++
++#include <sys/mount.h>
++
++/* From apps/fsutils/mksmartfs, linked into the kernel image (CONFIG_FSUTILS_MKSMARTFS). */
++extern int mksmartfs(FAR const char *pathname, uint16_t sectorsize);
++
+ FAR struct mtd_dev_s *stmp3770_nand_initialize(void);
+ 
+ /* 分区布局（1024 块 × 128 KB = 128 MB）：
+@@ -333,6 +344,8 @@ static int nand_fs_test(void)
+   fd = open("/mnt/boot.txt", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+   if (fd < 0)
+     {
++      nand_put("open for write FAILED");
++      nand_print_num("errno ", (uint32_t)errno);
+       return -errno;
+     }
+ 
+@@ -341,12 +354,19 @@ static int nand_fs_test(void)
+   close(fd);
+   if (n != len)
+     {
++      nand_put("write FAILED");
++      nand_print_num("ret ", (uint32_t)n);
++      nand_print_num("errno ", (uint32_t)errno);
+       return -5;
+     }
+ 
++  sync();
++
+   fd = open("/mnt/boot.txt", O_RDONLY);
+   if (fd < 0)
+     {
++      nand_put("reopen FAILED");
++      nand_print_num("errno ", (uint32_t)errno);
+       return -errno;
+     }
+ 
+@@ -484,13 +504,34 @@ static int hp39gii_nand_thread(int argc, char **argv)
+   ret = mount("/dev/smart0", "/mnt", "smartfs", 0, NULL);
+   if (ret < 0)
+     {
+-      nand_put("mount FAILED (unformatted?)");
+-      nand_print_num("errno ", (uint32_t)errno);
+-      nand_put("run: mksmartfs /dev/smart0");
+-      return 0;
+-    }
++      /* First boot after a flash: the volume has never been formatted.
++       * Format it here instead of asking the user to type mksmartfs.
++       */
++
++      nand_put("formatting smart0...");
+ 
+-  nand_put("mounted /mnt");
++      ret = mksmartfs("/dev/smart0", 0);
++      if (ret < 0)
++        {
++          nand_put("mksmartfs FAILED");
++          nand_print_num("errno ", (uint32_t)errno);
++          return 0;
++        }
++
++      ret = mount("/dev/smart0", "/mnt", "smartfs", 0, NULL);
++      if (ret < 0)
++        {
++          nand_put("mount FAILED after format");
++          nand_print_num("errno ", (uint32_t)errno);
++          return 0;
++        }
++
++      nand_put("formatted, mounted /mnt");
++    }
++  else
++    {
++      nand_put("mounted /mnt");
++    }
+ 
+   ret = nand_fs_test();
+   if (ret > 0)
+@@ -519,6 +560,62 @@ void stmp3770_boardinitialize(void)
+    */
+ }
+ 
++/****************************************************************************
++ * Name: board_power_off
++ *
++ * Description:
++ *  Power the calculator down.  This is what SHIFT+ON/C runs (and the NSH
++ *  "poweroff" command, when configured).  The file systems are flushed
++ *  first: SmartFS keeps sectors in RAM and the PMIC cut is immediate.
++ *
++ ****************************************************************************/
++
++int board_power_off(int status)
++{
++  /* Make sure the POWER block is out of reset; ExistOS does the same in
++   * portPowerInit().  Without this the reset write below is ignored.
++   */
++
++  BF_CLR(POWER_CTRL, CLKGATE);
++
++  {
++    volatile int i;
++
++    for (i = 0; i < 100000; i++)
++      {
++      }
++  }
++
++  sync();
++  umount("/mnt");
++  sync();
++
++  /* STMP3770 PMIC: unlock, assert power-down-off and power-down (the same
++   * sequence as ExistOS's portBoardPowerOff()).
++   */
++
++  BF_WR(POWER_RESET, UNLOCK, 0x3E77);
++  BF_WR(POWER_RESET, PWD_OFF, 1);
++  BF_WR(POWER_RESET, PWD, 1);
++
++  /* If the supply does not drop (emulator or a board powered over USB),
++   * park the CPU with interrupts disabled instead of running on.
++   */
++
++  up_irq_save();
++
++  for (; ; )
++    {
++      /* WFI on ARM926EJ-S is this CP15 operation; the "wfi" mnemonic needs
++       * ARMv6K and the toolchain rejects it for this core.
++       */
++
++      __asm volatile ("mcr p15, 0, %0, c7, c0, 4" :: "r" (0) : "memory");
++    }
++
++  return 0;
++}
++
+ void board_late_initialize(void)
+ {
+ #ifdef CONFIG_STMP3770_LCD
+diff --git a/boards/arm/stmp3770/hp39gii/src/hp39gii_kbd.c b/boards/arm/stmp3770/hp39gii/src/hp39gii_kbd.c
+index bf60edaf..2f855f8a 100644
+--- a/boards/arm/stmp3770/hp39gii/src/hp39gii_kbd.c
++++ b/boards/arm/stmp3770/hp39gii/src/hp39gii_kbd.c
+@@ -36,6 +36,7 @@
+ #include <string.h>
+ 
+ #include <nuttx/arch.h>
++#include <nuttx/board.h>
+ #include <nuttx/irq.h>
+ #include <nuttx/kthread.h>
+ #include <nuttx/sched.h>
+@@ -215,6 +216,25 @@ static void kbd_emit(int keycode)
+       return;
+     }
+ 
++  /* SHIFT + ON/C powers off, like the stock firmware.  The ON key has no
++   * character of its own, so it is handled here before the ASCII table.
++   */
++
++  if (keycode == KBD_KEY(10, 0))
++    {
++      bool shift = g_shift;
++
++      g_shift = false;
++
++      if (shift)
++        {
++          stmp3770_lcdcon_puts("\r\npower off\r\n");
++          board_power_off(0);
++        }
++
++      return;
++    }
++
+   if (g_alpha)
+     {
+       char c = g_alpha_map[keycode];
+-- 
+2.53.0
+

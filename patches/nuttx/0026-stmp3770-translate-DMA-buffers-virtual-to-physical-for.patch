@@ -1,0 +1,126 @@
+From 50a2587abb9b55ddec7304edcfcab1bf8b569261 Mon Sep 17 00:00:00 2001
+From: edwardzhu02 <explodingtnt@foxmail.com>
+Date: Tue, 3 Nov 2026 13:12:27 +0800
+Subject: [PATCH] stmp3770: translate DMA buffers virtual-to-physical for the
+ LCD
+
+The APBH engine behind the LCDIF addresses memory physically, but the
+driver hands it pointers to stack variables (the one-byte command and
+data macros) and to lineBuffer.  With on-demand paging enabled the task
+stacks and heap live at STMP3770_DATA_VBASE, backed by a different
+physical range, so every LCD command was read from the alias of the
+virtual address instead of the data: the panel kept showing the frame
+drawn before the scheduler started, while the console path ran to
+completion without error.
+
+stmp3770_va2pa() walks the L1/L2 tables (and is the identity function
+with the flat map), and the three descriptor assignments in
+LCDIF_WriteCMD/WriteDAT/ReadDAT go through it.
+
+Verified in EmuGII with CONFIG_STMP3770_PAGING=y: NSH boots, the text
+console paints, and the NAND thread reports through /dev/lcdcon.
+---
+ arch/arm/src/stmp3770/stmp3770_boot.c | 42 +++++++++++++++++++++++++++
+ arch/arm/src/stmp3770/stmp3770_lcd.c  | 12 ++++++--
+ 2 files changed, 51 insertions(+), 3 deletions(-)
+
+diff --git a/arch/arm/src/stmp3770/stmp3770_boot.c b/arch/arm/src/stmp3770/stmp3770_boot.c
+index 70630bf2..7c99aa8a 100644
+--- a/arch/arm/src/stmp3770/stmp3770_boot.c
++++ b/arch/arm/src/stmp3770/stmp3770_boot.c
+@@ -189,6 +189,48 @@ static void stmp3770_mmuinit(void)
+ 
+ #endif /* CONFIG_STMP3770_MMU */
+ 
++/****************************************************************************
++ * Name: stmp3770_va2pa
++ *
++ * Description:
++ *  Translate a kernel virtual address to the physical address the DMA
++ *  engines (APBH channels used by the LCD and the GPMI) see.  With the flat
++ *  map this is the identity function; with on-demand paging the data region
++ *  lives at STMP3770_DATA_VBASE but is backed by physical STMP3770_DATA_PBASE,
++ *  and task stacks and heap buffers are allocated there.  Anything handed to
++ *  an APBH descriptor must go through this first: the LCD command/data bytes
++ *  are passed as pointers to stack variables, and the DMA would otherwise
++ *  read whatever happens to live at the alias of that virtual address.
++ *
++ ****************************************************************************/
++
++uint32_t stmp3770_va2pa(uint32_t va)
++{
++#ifdef CONFIG_STMP3770_PAGING
++  uint32_t *l1 = (uint32_t *)PGTABLE_BASE_VADDR;
++  uint32_t  d1 = l1[va >> 20];
++
++  if ((d1 & 3) == PMD_TYPE_COARSE)
++    {
++      uint32_t *l2 = (uint32_t *)(d1 & 0xfffffc00);
++      uint32_t  d2 = l2[(va & 0x000fffff) >> 12];
++
++      if ((d2 & 3) == PTE_TYPE_SMALL)
++        {
++          return (d2 & 0xfffff000) | (va & 0xfff);
++        }
++    }
++  else if ((d1 & 3) == PMD_TYPE_SECT)
++    {
++      return (d1 & 0xfff00000) | (va & 0x000fffff);
++    }
++#endif
++
++  return va;
++}
++
++
++
+ static void stmp3770_setupmappings(void)
+ {
+   uint32_t *pgtable = (uint32_t *)PGTABLE_BASE_VADDR;
+diff --git a/arch/arm/src/stmp3770/stmp3770_lcd.c b/arch/arm/src/stmp3770/stmp3770_lcd.c
+index 8d900d05..a04d58b9 100644
+--- a/arch/arm/src/stmp3770/stmp3770_lcd.c
++++ b/arch/arm/src/stmp3770/stmp3770_lcd.c
+@@ -80,6 +80,12 @@ static volatile bool opaFinish;
+ 
+ static uint8_t lineBuffer[SCREEN_WIDTH + 4] __aligned(4);
+ 
++/* APBH addresses memory physically; buffers on a task stack live in the
++ * remapped data region when on-demand paging is enabled.
++ */
++
++extern uint32_t stmp3770_va2pa(uint32_t va);
++
+ static void LCDIF_PowerUp(void) {
+     int i;
+ 
+@@ -255,7 +261,7 @@ static void LCDIF_WriteCMD(uint8_t *dat, uint32_t len) {
+     chains_wr.DMA_Command = BV_FLD(APBH_CHn_CMD, COMMAND, DMA_READ);
+     chains_wr.PioWord.B.DATA_SELECT = 0; // 0:command mode   1:data mode
+     chains_wr.PioWord.B.READ_WRITEB = 0; // 0:write mode     1:read mode
+-    chains_wr.pDMABuffer = (uint32_t)dat;
++    chains_wr.pDMABuffer = stmp3770_va2pa((uint32_t)dat);
+     chains_wr.DMA_XferBytes = len;
+     chains_wr.PioWord.B.COUNT = len;
+ 
+@@ -290,7 +296,7 @@ static void LCDIF_WriteDAT(uint8_t *dat, uint32_t len) {
+     chains_wr.DMA_Command = BV_FLD(APBH_CHn_CMD, COMMAND, DMA_READ);
+     chains_wr.PioWord.B.DATA_SELECT = 1; // 0:command mode   1:data mode
+     chains_wr.PioWord.B.READ_WRITEB = 0; // 0:write mode     1:read mode
+-    chains_wr.pDMABuffer = (uint32_t)dat;
++    chains_wr.pDMABuffer = stmp3770_va2pa((uint32_t)dat);
+     chains_wr.DMA_XferBytes = len;
+     chains_wr.PioWord.B.COUNT = len;
+ 
+@@ -325,7 +331,7 @@ static void LCDIF_ReadDAT(uint8_t *dat, uint32_t len) {
+     chains_wr.DMA_Command = BV_FLD(APBH_CHn_CMD, COMMAND, DMA_WRITE);
+     chains_wr.PioWord.B.DATA_SELECT = 1; // 0:command mode   1:data mode
+     chains_wr.PioWord.B.READ_WRITEB = 1; // 0:write mode     1:read mode
+-    chains_wr.pDMABuffer = (uint32_t)dat;
++    chains_wr.pDMABuffer = stmp3770_va2pa((uint32_t)dat);
+     chains_wr.DMA_XferBytes = len;
+     chains_wr.PioWord.B.COUNT = len;
+ 
+-- 
+2.53.0
+
