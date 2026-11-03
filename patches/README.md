@@ -3,7 +3,7 @@
 Three series, all pinned to an exact upstream commit (see `scripts/config.sh`).
 They are applied with `git am`, in filename order, by `scripts/fetch-deps.sh`.
 
-## `nuttx/` — 24 patches
+## `nuttx/` — 25 patches
 
 Apache NuttX, base `1080f140`. The result is a tree that builds NuttX for
 `hp39gii:nsh` and nothing else.
@@ -34,6 +34,7 @@ Apache NuttX, base `1080f140`. The result is a tree that builds NuttX for
 | 0022 | size the NCB metadata buffer to the real OOB width | `meta[16]` held 19 bytes; fixes a `-Warray-bounds` warning |
 | 0023 | LCD text console in 1bpp | 32 KB shadow buffer -> 4 KB; `.bss` 56,992 -> 28,576 B, heap +28,768 B |
 | 0024 | bring the MMU up from C | two-section map + CP15 from `arm_boot()`; needed before paging, `arm_head.S` cannot be used here |
+| 0025 | on-demand paging framework | coarse window from NAND, `up_fillpage()`, 896-page self-test; **off by default**: the first fault dies in the fault entry, see `docs/khicas.md` |
 
 Patch 0021 is a plain `git diff` with a message and diffstat written by hand. It
 applies with `git am` like the others, but if you rebase the series, regenerate it

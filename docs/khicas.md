@@ -295,7 +295,40 @@ is dead code until step 1 lands):
   are not covered by the existing clear loop, so on a cold boot they would otherwise
   contain garbage that looks like valid mappings.
 
-## 7. What is reusable from ExistOS, verbatim
+### 7.2 Where paging actually stands
+
+The framework is in the tree (patch 0025) and is compiled whenever
+`CONFIG_LEGACY_PAGING` is on, but it is **off in the shipping defconfig** because the
+first fault does not survive the fault entry.
+
+Verified in EmuGII before that point:
+
+| Check | Result |
+|---|---|
+| window invalid before first touch | `L1[0] = 0x7C011`, `L2[60] = 0` |
+| NAND blob round-trip (896 x 4 KB written through GPMI) | pages 0 and 895 read back `0xE59F0000 / 0xE12FFF1E / index` |
+| first access to `0x3C000` | does take a translation abort |
+
+Then it dies: the vector switches to SYS mode and stores the context at the stack
+pointer of the faulting task, and by the time it gets there that pointer is `0x9F`, so
+`stmia` raises an alignment fault (FAR `0x9F`, FSR `1`) and the kernel panics in
+`arm_dataabort` / `arm_vectorprefetch`. The data path (reading the window) and the
+prefetch path (calling into it) fail identically, so the fill is not the problem.
+
+Two upstream bugs were found on the way and are fixed in the same patch:
+
+* `arm_allocpage.c` compared the frame counter against `CONFIG_LEGACY_PAGING` -- a bool,
+  value 1 -- instead of `CONFIG_PAGING_NPPAGED`, so every page after the first reused
+  frame 0.
+* `page.h` defaults the data region to the *end of the locked region*, i.e. on top of the
+  paged window. Any board that pages must set `PAGING_DATA_PBASE/VBASE`; those Kconfig
+  options did not exist and are added by the patch.
+
+Next step: instrument the vector, or check whether `pg_miss()` is reached before the
+context is fully saved -- `pg_miss()` performs a context switch from inside the abort
+handler, and that is the part this port has never exercised.
+
+## 8. What is reusable from ExistOS, verbatim
 
 * `Libs/libcas.libcpp`, `libkcasgui.libcpp`, `libgmp.libcpp`, `libtommath.libcpp` — ARM
   EABI5 static archives, soft float, `-marm`, same ABI as this port.
