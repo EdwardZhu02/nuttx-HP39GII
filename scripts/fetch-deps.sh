@@ -92,7 +92,7 @@ fi
 
 if [ ! -f "$NUTTX_DIR/.hp39gii-patched" ]; then
   step "applying patches/nuttx"
-  apply_series "$NUTTX_DIR" "$ROOT/patches/nuttx" 29 "$NUTTX_BASE"
+  apply_series "$NUTTX_DIR" "$ROOT/patches/nuttx" 30 "$NUTTX_BASE"
   : > "$NUTTX_DIR/.hp39gii-patched"
 else
   note "nuttx: patch series already applied"

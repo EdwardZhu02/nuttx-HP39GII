@@ -1,0 +1,32 @@
+From e55e01096b0e3408139e194b705c13e9566d1ae6 Mon Sep 17 00:00:00 2001
+From: edwardzhu02 <explodingtnt@foxmail.com>
+Date: Tue, 3 Nov 2026 19:39:29 +0800
+Subject: [PATCH] hp39gii: the defconfig turned its own paging option off
+
+CONFIG_STMP3770_PAGING=y was followed by the stale
+"# CONFIG_STMP3770_PAGING is not set" left over from when paging shipped
+disabled.  The last occurrence wins, so a fresh configure.sh followed by
+make olddefconfig resolved paging to "n" -- and STMP3770_KHICAS depends on
+it, so a kernel built from this defconfig had no KhiCAS and no .pgtext
+section at all.  Local builds never noticed because they reuse an older
+.config and never re-resolve it.
+
+Verified in a clean checkout: configure.sh hp39gii:nsh + make olddefconfig
+now yields CONFIG_STMP3770_PAGING=y and CONFIG_STMP3770_KHICAS=y.
+---
+ boards/arm/stmp3770/hp39gii/configs/nsh/defconfig | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/boards/arm/stmp3770/hp39gii/configs/nsh/defconfig b/boards/arm/stmp3770/hp39gii/configs/nsh/defconfig
+index f116ecc6..498a778a 100644
+--- a/boards/arm/stmp3770/hp39gii/configs/nsh/defconfig
++++ b/boards/arm/stmp3770/hp39gii/configs/nsh/defconfig
+@@ -78,5 +78,4 @@ CONFIG_STMP3770_MMU=y
+ CONFIG_STMP3770_PAGING=y
+ CONFIG_STMP3770_KHICAS=y
+ CONFIG_ARM_DCACHE_DISABLE=y
+-# CONFIG_STMP3770_PAGING is not set
+ # CONFIG_STMP3770_PAGETEST is not set
+-- 
+2.53.0
+
