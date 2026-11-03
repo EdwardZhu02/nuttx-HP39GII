@@ -1,0 +1,182 @@
+From c2c13eb980440d6328cf0645dac21c24401ad56d Mon Sep 17 00:00:00 2001
+From: edwardzhu02 <explodingtnt@foxmail.com>
+Date: Tue, 3 Nov 2026 11:19:12 +0800
+Subject: [PATCH] stmp3770: bring the MMU up from C at the end of arm_boot
+
+The port has been running with the MMU off since the hardware bring-up
+(patch 0012), which makes on-demand paging impossible: no MMU means no
+translation faults. Turning it back on cannot be done with arm_head.S:
+
+  - arm_head.S "undoes the identity mapping" of the megabyte section that
+    holds the page table.  On this board the page table is at 0x7C000 and
+    .text at 0x0, i.e. the same section, so the code unmaps itself and the
+    prefetch vectors go with it (measured: ~2.9M/s abort storm).
+  - arm_head.S expects the vector table to be in the image at address 0;
+    here it is copied to 0 at run time by stmp3770_copyvectors().
+
+So build a two-section map (SRAM at 0, peripherals at 0x80000000) and set
+CP15 from C, after the vectors are in place:
+
+  - CP15 c3 (DACR) must be written first: it resets to 0, which denies
+    every domain, and with the tables otherwise correct that shows up as a
+    ~2.8M/s abort storm on the first fetch after CR_M.
+  - CR_V is cleared explicitly; the SDP loader hands over with V=1 and
+    nothing is mapped at 0xFFFF0000.
+  - D-cache and I-cache stay off: the LCD and GPMI paths DMA into SRAM and
+    have no cache maintenance yet.
+
+Verified in EmuGII: the NSH screen is pixel-identical to the MMU-off build,
+the 100 Hz tick runs (arm_except ~100/s), and there is no abort storm. Not
+yet verified on hardware.
+
+Gated by CONFIG_STMP3770_MMU, set in the nsh defconfig. The Kconfig default
+stays off so other configurations keep the known-good MMU-less boot.
+---
+ arch/arm/src/stmp3770/Kconfig                 | 15 +++
+ arch/arm/src/stmp3770/stmp3770_boot.c         | 91 +++++++++++++++++++
+ .../stmp3770/hp39gii/configs/nsh/defconfig    |  2 +
+ 3 files changed, 108 insertions(+)
+
+diff --git a/arch/arm/src/stmp3770/Kconfig b/arch/arm/src/stmp3770/Kconfig
+index 9dab7e9d..92827850 100644
+--- a/arch/arm/src/stmp3770/Kconfig
++++ b/arch/arm/src/stmp3770/Kconfig
+@@ -49,6 +49,21 @@ config STMP3770_NAND
+ 		GPMI + ECC8 (BCH) NAND 控制器驱动（从 ExistOS stmp_gpmi.c 移植）。
+ 		页 2048 B / 元数据 64 B / 每块 64 页 / 1024 块（128 MB）。
+ 
++config STMP3770_MMU
++	bool "Boot with the MMU enabled"
++	default n
++	---help---
++		Select this to enter nx_start() with the MMU on and the initial
++		one-megabyte section map built by arm_head.S, instead of the MMU-off
++		path in arm_nommuhead.S.
++
++		The default is off: the STMP37xx SDP loader leaves CP15 in an
++		unknown state and patch 0012 got this board booting by turning the
++		MMU and the D-cache off at reset.  Turning it back on is a separate
++		bring-up step -- verify in EmuGII first, and keep
++		CONFIG_ARM_DCACHE_DISABLE set until the DMA paths have been checked
++		for cache maintenance.
++
+ config STMP3770_KBD
+ 	bool "Keyboard matrix"
+ 	default n
+diff --git a/arch/arm/src/stmp3770/stmp3770_boot.c b/arch/arm/src/stmp3770/stmp3770_boot.c
+index 1f56c593..8066b874 100644
+--- a/arch/arm/src/stmp3770/stmp3770_boot.c
++++ b/arch/arm/src/stmp3770/stmp3770_boot.c
+@@ -35,6 +35,90 @@
+  * 这里补一条 1MB section，覆盖 0x8000_0000-0x800F_FFFF（全部寄存器都在其中）。
+  */
+ 
++/****************************************************************************
++ * MMU bring-up
++ *
++ * arm_head.S is not usable on this board: it removes the identity mapping of
++ * the megabyte section that holds the page table (0x7C000), which is the same
++ * section the code executes from, and it assumes the vector table is already
++ * in the image at address 0 -- here the vectors are copied to 0 at run time by
++ * stmp3770_copyvectors().  So the MMU is brought up here instead, after the
++ * vectors are in place and with the whole 512 KB mapped as one section.
++ *
++ * D-cache and I-cache stay off for now: the LCD and GPMI both use DMA on
++ * buffers in SRAM, and the drivers were written with the caches off.
++ ****************************************************************************/
++
++#ifdef CONFIG_STMP3770_MMU
++
++static inline void stmp3770_cp15_ttbr(uint32_t ttbr)
++{
++  __asm volatile ("mcr p15, 0, %0, c2, c0, 0" :: "r" (ttbr) : "memory");
++}
++
++static inline uint32_t stmp3770_cp15_c1(void)
++{
++  uint32_t val;
++
++  __asm volatile ("mrc p15, 0, %0, c1, c0, 0" : "=r" (val));
++  return val;
++}
++
++static inline void stmp3770_cp15_set_c1(uint32_t val)
++{
++  __asm volatile ("mcr p15, 0, %0, c1, c0, 0" :: "r" (val) : "memory");
++  __asm volatile ("mcr p15, 0, %0, c7, c10, 4" :: "r" (0) : "memory");
++  __asm volatile ("mcr p15, 0, %0, c7, c5, 0" :: "r" (0) : "memory");   /* I-cache */
++  __asm volatile ("mcr p15, 0, %0, c8, c7, 0" :: "r" (0) : "memory");   /* TLB */
++}
++
++static void stmp3770_mmuinit(void)
++{
++  uint32_t *l1 = (uint32_t *)PGTABLE_BASE_VADDR;
++  uint32_t  i;
++
++  /* One 1 MB section covers the whole 512 KB of SRAM, and one covers the
++   * peripheral block at 0x8000_0000.  Everything else stays unmapped, so a
++   * stray access is a clean translation fault instead of a bus error.
++   */
++
++  for (i = 0; i < (PGTABLE_SIZE / sizeof(uint32_t)); i++)
++    {
++      l1[i] = 0;
++    }
++
++  l1[STMP3770_SRAM_BASE >> 20] =
++      (STMP3770_SRAM_BASE & 0xfff00000) | MMU_MEMFLAGS;
++  l1[STMP3770_REGS_BASE >> 20] =
++      (STMP3770_REGS_BASE & 0xfff00000) | MMU_IOFLAGS;
++
++  __asm volatile ("mcr p15, 0, %0, c7, c10, 4" :: "r" (0) : "memory");
++  __asm volatile ("mcr p15, 0, %0, c8, c7, 0" :: "r" (0) : "memory");
++
++  stmp3770_cp15_ttbr(PGTABLE_BASE_PADDR);
++
++  /* DACR: every domain client.  CP15 c3 resets to 0, which means "no access"
++   * for all domains -- with the tables otherwise correct, the first fetch
++   * after CR_M would fault and the vector page is in the same denied domain,
++   * which shows up as a ~2.8M/s abort storm. */
++
++  __asm volatile ("mcr p15, 0, %0, c3, c0, 0" :: "r" (0x55555555) : "memory");
++
++  /* CR_M  - MMU on
++   * CR_V  - clear: the vectors live at 0 (copied by stmp3770_copyvectors)
++   * CR_C  - D-cache: left off, the DMA paths have no maintenance yet
++   * CR_I  - I-cache: left off for the same reason
++   * CR_A  - alignment trap: off
++   */
++
++  stmp3770_cp15_set_c1((stmp3770_cp15_c1() | CR_M) &
++                       ~(CR_V | CR_C | CR_I | CR_A));
++
++  __asm volatile ("mcr p15, 0, %0, c8, c7, 0" :: "r" (0) : "memory");
++}
++
++#endif /* CONFIG_STMP3770_MMU */
++
+ static void stmp3770_setupmappings(void)
+ {
+   uint32_t *pgtable = (uint32_t *)PGTABLE_BASE_VADDR;
+@@ -199,4 +283,11 @@ void arm_boot(void)
+   { extern void stmp3770_stagew(int); stmp3770_stage(4); }
+   stmp3770_copyvectors();
+   { extern void stmp3770_stagew(int); stmp3770_stage(5); }
++
++#ifdef CONFIG_STMP3770_MMU
++  /* 向量已经在 0，页表已经在 0x7C000：这时候开 MMU 才是安全的 */
++
++  stmp3770_mmuinit();
++  { extern void stmp3770_stagew(int); stmp3770_stage(6); }
++#endif
+ }
+diff --git a/boards/arm/stmp3770/hp39gii/configs/nsh/defconfig b/boards/arm/stmp3770/hp39gii/configs/nsh/defconfig
+index 73d87588..c92a602d 100644
+--- a/boards/arm/stmp3770/hp39gii/configs/nsh/defconfig
++++ b/boards/arm/stmp3770/hp39gii/configs/nsh/defconfig
+@@ -74,3 +74,5 @@ CONFIG_UART0_IRQ=0
+ CONFIG_UART0_CLK_FREQ=24000000
+ CONFIG_MTD_PARTITION=y
+ CONFIG_FSUTILS_MKSMARTFS=y
++CONFIG_STMP3770_MMU=y
++CONFIG_ARM_DCACHE_DISABLE=y

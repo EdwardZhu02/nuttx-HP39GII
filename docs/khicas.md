@@ -229,7 +229,7 @@ bulk of the typing, P0/P2 are mechanical.
    `.init_array` at startup, and `atexit`/`__cxa_atexit` behaviour under NuttX differs
    from `rdimon`. Expect a few of these to need stubs.
 
-## 7. Blocker: this port boots with the MMU off
+## 7. The MMU is on now (was: the blocker for paging)
 
 `CONFIG_LEGACY_PAGING` builds, links and looks healthy, but none of it can ever
 run on the current port, and this is worth writing down before anyone spends
@@ -259,7 +259,16 @@ into it would take a data/prefetch abort that the handler treats as a real fault
 
 ### 7.1 What has to happen first
 
-A separate, deliberately scoped milestone: **bring the MMU back up**.
+**Status: done.** Patch 0024 enables the MMU from C at the end of `arm_boot()`, after
+`stmp3770_copyvectors()` has put the vectors at 0 and with a two-section map (SRAM at 0,
+peripherals at `0x8000_0000`). Verified in EmuGII: NSH is pixel-identical to the MMU-off
+build and the 100 Hz tick runs. `arm_head.S` is not usable here -- it unmaps the megabyte
+section that holds both the code and the page table, and it expects the vector table to be
+in the image at 0. Two ARM926 details cost a debug cycle each and are worth remembering:
+CP15 `c3` (DACR) resets to 0 = all domains denied, and `CR_V` has to be *cleared*, not just
+left alone, because the loader hands over with `V=1`.
+
+The original plan for that milestone, kept for the record:
 
 1. Select `arm_head.S` for this board when paging is enabled (`HEAD_ASRC`), keeping
    `arm_nommuhead.S` for the paging-off configuration so the working build is not

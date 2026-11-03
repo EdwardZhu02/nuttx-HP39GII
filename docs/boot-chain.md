@@ -170,6 +170,22 @@ menu's diagnostic line, with the stock boot ROM having just handed control over:
 | `VDDDCTRL` | `0x0031_0710` | `TRG=0x10` ≈ 1.2 V |
 | `VDDIOCTRL` | `0x0000_170C` | `TRG=0x0C` ≈ 3.1 V |
 
+### Does the menu have to set up the MMU before the handover?
+
+No. `OSLoader/bootmenu.c` contains no CP15 writes at all -- the menu firmware does not
+run the VM (see the note in `OSLoader/VmMgr/vmMgr.c`: the cache/ZRAM arrays are there to
+satisfy the linker, not to be used). The `c1` value above is what the stock boot ROM
+left behind, and it has the MMU off.
+
+That is the state NuttX expects: `arm_nommuhead.S` disables the MMU and the D-cache and
+clears `V` in its first instructions regardless of what it inherits, so the handover is
+safe whether the menu ever turns the MMU on or not.
+
+It also means the MMU can be turned back on *inside* NuttX without any coherency debt:
+the CPU arrives with both caches off, so there are no dirty lines to clean and no stale
+TLB entries to invalidate. Patch 0024 does exactly that at the end of `arm_boot()`, once
+the vectors are copied to 0 and the page table is in place.
+
 The menu inherits the ROM's conservative 1.2 V setting and does not raise it. NuttX does:
 `stmp3770_powerconfig()` sets `VDDD` 1.45 V, `VDDA` 1.8 V, `VDDIO` 3.3 V, and
 `stmp3770_clockconfig()` reconfigures the PLL, CPU divider 5 and `CPUFRAC` 22 — the same
