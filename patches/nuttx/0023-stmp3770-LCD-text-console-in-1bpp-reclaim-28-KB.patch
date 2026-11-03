@@ -1,0 +1,120 @@
+From 469e28874d03dc018d2b2df218f6a49986c15905 Mon Sep 17 00:00:00 2001
+From: edwardzhu02 <explodingtnt@foxmail.com>
+Date: Tue, 3 Nov 2026 10:58:14 +0800
+Subject: [PATCH] stmp3770: keep the LCD text console in 1bpp, reclaim 28 KB of
+ SRAM
+
+The text console kept a shadow framebuffer at one byte per pixel --
+256x128 = 32 KB, 6% of the 512 KB SRAM, to draw 32x16 characters. The
+panel interface still wants one byte per pixel, so convert the right
+place: keep 1 bit per pixel (4 KB) and expand a single row into a 256-byte
+staging buffer just before portDispFlushAreaBuf().
+
+Glyph columns start on byte boundaries, so lcdcon_blit() is now eight byte
+stores per character instead of 64 per-pixel writes; the flush does the
+bit-to-byte expansion, 32 bytes per row.
+
+Measured: .bss 56,992 -> 28,576 B, _ebss 0x3B680 -> 0x34820, i.e. 28,768 B
+more heap. Verified in EmuGII: the panel is pixel-identical to the 8bpp
+build over the whole LCD area (banner, prompt and hint row), which covers
+clear + blit + flush; scrolling re-renders through the same path.
+
+1bpp is also the format KhiCAS wants for its own screen buffer, so this is
+the shape the CAS support needs anyway.
+---
+ arch/arm/src/stmp3770/stmp3770_lcdcon.c | 50 +++++++++++++++++++------
+ 1 file changed, 38 insertions(+), 12 deletions(-)
+
+diff --git a/arch/arm/src/stmp3770/stmp3770_lcdcon.c b/arch/arm/src/stmp3770/stmp3770_lcdcon.c
+index 1da92cca..30542cb9 100644
+--- a/arch/arm/src/stmp3770/stmp3770_lcdcon.c
++++ b/arch/arm/src/stmp3770/stmp3770_lcdcon.c
+@@ -120,8 +120,17 @@ static const uint8_t g_font[95][8] =
+   {0x72,0x9c,0x00,0x00,0x00,0x00,0x00,0x00},
+ };
+ 
+-/* text framebuffer: 1 byte per pixel, 0x00 = dark/on */
+-static uint8_t g_fb[W * H];
++/* Text framebuffer: 1 bit per pixel, 1 = dark/on.
++ *
++ * The panel interface (portDispFlushAreaBuf) takes one byte per pixel, so a
++ * single row is expanded into g_row on the way out.  At 256x128 this costs
++ * 4 KB instead of 32 KB, which matters on a machine with 512 KB of SRAM.
++ */
++
++#define FB_STRIDE (W / 8)              /* bytes per framebuffer row */
++
++static uint8_t g_fb[H * FB_STRIDE];
++static uint8_t g_row[W];
+ 
+ /* 文本按「行」保存，屏幕只是其中 ROWS 行的视图；这样才有回滚。
+  * g_sb 是环形缓冲，绝对行号 abs 存在 g_sb[abs % SB_LINES]。
+@@ -161,7 +170,25 @@ static void lcd_flush_region(uint32_t x0, uint32_t y0,
+ 
+   for (y = y0; y <= y1; y++)
+     {
+-      portDispFlushAreaBuf(0, y, W - 1, y, g_fb + y * W);
++      const uint8_t *src = g_fb + y * FB_STRIDE;
++      uint8_t *dst = g_row;
++      int i;
++
++      for (i = 0; i < FB_STRIDE; i++)
++        {
++          uint8_t bits = src[i];
++
++          *dst++ = (bits & 0x80) ? 0x00 : 0xff;
++          *dst++ = (bits & 0x40) ? 0x00 : 0xff;
++          *dst++ = (bits & 0x20) ? 0x00 : 0xff;
++          *dst++ = (bits & 0x10) ? 0x00 : 0xff;
++          *dst++ = (bits & 0x08) ? 0x00 : 0xff;
++          *dst++ = (bits & 0x04) ? 0x00 : 0xff;
++          *dst++ = (bits & 0x02) ? 0x00 : 0xff;
++          *dst++ = (bits & 0x01) ? 0x00 : 0xff;
++        }
++
++      portDispFlushAreaBuf(0, y, W - 1, y, g_row);
+     }
+ }
+ 
+@@ -232,25 +259,24 @@ static int lcdcon_min_top(void)
+ static void lcdcon_blit(int row, int col, int ch)
+ {
+   const uint8_t *glyph;
+-  int x0 = col * 8;
++  uint8_t *dst;
+   int y0 = row * 8;
+   int r;
+-  int c;
+ 
+   if (ch < 32 || ch > 126)
+     {
+       ch = 32;
+     }
+ 
++  /* A glyph row is exactly one framebuffer byte and glyph columns start on
++   * byte boundaries, so drawing a character is eight byte stores. */
++
+   glyph = g_font[ch - 32];
++  dst = g_fb + y0 * FB_STRIDE + col;
++
+   for (r = 0; r < 8; r++)
+     {
+-      uint8_t bits = glyph[r];
+-      for (c = 0; c < 8; c++)
+-        {
+-          g_fb[(y0 + r) * W + (x0 + c)] =
+-              (bits & (0x80 >> c)) ? 0x00 : 0xff;
+-        }
++      dst[r * FB_STRIDE] = glyph[r];
+     }
+ 
+   lcdcon_mark_dirty(y0, y0 + 7);
+@@ -272,7 +298,7 @@ static void lcdcon_render(void)
+ {
+   int r;
+ 
+-  memset(g_fb, 0xff, sizeof(g_fb));
++  memset(g_fb, 0, sizeof(g_fb));
+ 
+   for (r = 0; r < TEXT_ROWS; r++)
+     {
