@@ -111,6 +111,7 @@ jobs:
           files: |
             dist/*.sb
             dist/nuttx.bin
+            dist/khicas.bin
             dist/SHA256SUMS
           fail_on_unmatched_files: true
 
