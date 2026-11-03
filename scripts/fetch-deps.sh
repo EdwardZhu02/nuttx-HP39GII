@@ -84,7 +84,7 @@ fetch_repo "$APPS_DIR" "$APPS_URL" "$APPS_BASE" nuttx-apps
 
 if [ ! -f "$APPS_DIR/.hp39gii-patched" ]; then
   step "applying patches/apps"
-  apply_series "$APPS_DIR" "$ROOT/patches/apps" 1 "$APPS_BASE"
+  apply_series "$APPS_DIR" "$ROOT/patches/apps" 2 "$APPS_BASE"
   : > "$APPS_DIR/.hp39gii-patched"
 else
   note "nuttx-apps: patch series already applied"
@@ -92,7 +92,7 @@ fi
 
 if [ ! -f "$NUTTX_DIR/.hp39gii-patched" ]; then
   step "applying patches/nuttx"
-  apply_series "$NUTTX_DIR" "$ROOT/patches/nuttx" 25 "$NUTTX_BASE"
+  apply_series "$NUTTX_DIR" "$ROOT/patches/nuttx" 27 "$NUTTX_BASE"
   : > "$NUTTX_DIR/.hp39gii-patched"
 else
   note "nuttx: patch series already applied"
@@ -109,7 +109,7 @@ fetch_repo "$EXISTOS_DIR" "$EXISTOS_URL" "$EXISTOS_BASE" existos
 
 if [ ! -f "$EXISTOS_DIR/.hp39gii-patched" ]; then
   step "applying patches/existos"
-  apply_series "$EXISTOS_DIR" "$ROOT/patches/existos" 2 "$EXISTOS_BASE"
+  apply_series "$EXISTOS_DIR" "$ROOT/patches/existos" 3 "$EXISTOS_BASE"
   : > "$EXISTOS_DIR/.hp39gii-patched"
 else
   note "existos: patch series already applied"
