@@ -39,10 +39,12 @@ Verified on real hardware unless marked otherwise.
 | Boot menu, "HP OS" entry | ❌ disabled — the stock boot flow needs the mask ROM and high vectors; executing it from the menu ends in a black screen (see [docs/boot-chain.md](docs/boot-chain.md#why-hp-os-is-disabled)) |
 | USB device (CDC-ACM) under NuttX | ❌ not implemented |
 | LCD framebuffer / graphics beyond the 32×16 text console | ❌ not implemented |
+| KhiCAS (Giac/Xcas) | ⚠️ not started — 2.44 MB of code on a 512 KB machine, so it needs on-demand paging; the NuttX side of that is mapped out in [docs/khicas.md](docs/khicas.md) |
 | Linux on this device | ❌ impossible — 512 KB of RAM, see [docs/hardware.md](docs/hardware.md#there-is-no-dram) |
 
-NuttX uses about 186 KB of the 512 KB SRAM (36 %), so roughly 320 KB is left for the
-heap, the SmartFS cache and applications.
+NuttX uses about 215 KB of the 512 KB SRAM (42 %), so roughly 285 KB is left for the
+heap, the SmartFS cache and applications. Of that 215 KB, 4 KB is the LCD text
+framebuffer (1 bit per pixel); it was 32 KB until the console was switched to 1bpp.
 
 ## Quick start
 
