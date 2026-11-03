@@ -229,6 +229,63 @@ bulk of the typing, P0/P2 are mechanical.
    `.init_array` at startup, and `atexit`/`__cxa_atexit` behaviour under NuttX differs
    from `rdimon`. Expect a few of these to need stubs.
 
+## 7. Blocker: this port boots with the MMU off
+
+`CONFIG_LEGACY_PAGING` builds, links and looks healthy, but none of it can ever
+run on the current port, and this is worth writing down before anyone spends
+another afternoon on it.
+
+Patch 0012 (`boot to NSH on real hardware`) changed `arch/arm/src/arm/arm_nommuhead.S`
+to **turn the MMU and the D-cache off and clear the CP15 V bit at reset**, because
+the STMP37xx SDP loader leaves CP15 in an unknown state. That is the configuration
+the calculator actually runs today.
+
+The consequence for paging:
+
+* `CONFIG_ARCH_USE_MMU=y` is set in the port's Kconfig, so Kconfig happily accepts
+  `CONFIG_LEGACY_PAGING=y` (it `depends on ARCH_USE_MMU`).
+* But `arch/arm/src/arm/Make.defs:27` selects `HEAD_ASRC = arm_nommuhead.S`
+  unconditionally. `arm_head.S` — the only file that enables the MMU and builds the
+  initial L1/L2 tables for the paged window — is never assembled, so the edit to its
+  L2-clear path does not even reach the object file.
+* `arch/arm/src/arm/arm_dataabort.c` and `arm_prefetchabort.c` still call `pg_miss()`
+  when a fault address falls inside `PG_PAGED_*`, but with the MMU off there are no
+  translation faults, so `up_fillpage()` is never entered.
+
+In other words: with the MMU off, `PG_PAGED_VBASE` is just an address, and the
+3.5 MB window is a hole above RAM that cannot be reached at all. A test that calls
+into it would take a data/prefetch abort that the handler treats as a real fault
+(`PANIC_WITH_REGS`), not a page miss.
+
+### 7.1 What has to happen first
+
+A separate, deliberately scoped milestone: **bring the MMU back up**.
+
+1. Select `arm_head.S` for this board when paging is enabled (`HEAD_ASRC`), keeping
+   `arm_nommuhead.S` for the paging-off configuration so the working build is not
+   disturbed.
+2. Boot it in EmuGII with the D-cache still off and confirm NSH still comes up. The
+   initial mappings come from `arm_head.S` plus the `stmp3770_setupmappings()` call
+   that already exists for the `0x8000_0000` peripheral section — that call was
+   written when the MMU was on, and is inert today.
+3. Only then enable `CONFIG_LEGACY_PAGING` and the NAND-backed `up_fillpage()`.
+
+Work already done for step 3, kept as `paging-wip.patch` (not committed, because it
+is dead code until step 1 lands):
+
+* `stmp3770_memorymap.h`: a paging layout — locked 0..`0x3C000`, 24 x 4 KB frames at
+  `0x3C000`, 36 x 4 KB heap at `0x54000`, L1 at `0x78000` and L2 coarse tables at
+  `0x7C000`; virtual window `0x3C000`..`0x3BC000`.
+* `stmp3770_allocateheap.c`: heap is the data region, not `_ebss`..RAM top.
+* `hp39gii_fillpage.c`: `up_fillpage()` maps `far - PG_PAGED_VBASE` onto a NAND blob
+  and reads one 4 KB page through the GPMI MTD.
+* `hp39gii_pagetest.c`: writes 896 four-KB records to NAND, each a three-instruction
+  stub returning its own index, then calls every record through the window — 896
+  faults against 24 frames, so replacement is exercised too.
+* `arm_head.S`: clear the L2 coarse tables at reset; they sit above the 16 KB L1 and
+  are not covered by the existing clear loop, so on a cold boot they would otherwise
+  contain garbage that looks like valid mappings.
+
 ## 7. What is reusable from ExistOS, verbatim
 
 * `Libs/libcas.libcpp`, `libkcasgui.libcpp`, `libgmp.libcpp`, `libtommath.libcpp` — ARM
