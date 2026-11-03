@@ -1,0 +1,889 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: edwardzhu02 <explodingtnt@foxmail.com>
+Subject: [PATCH] stmp3770: synchronous text pager, 888/888 paged calls pass
+
+Adds the machinery for running code out of a 3.5 MB window backed by NAND,
+and it works: the self-test writes 896 four-KB records to NAND, calls every
+one through the window and gets the right index back from all 888 of them
+(8 pages are pinned for the page tables) with 16 frames, so 872 replacements
+happen on the way.
+
+How it works:
+
+  - stmp3770_map_paged() builds four coarse tables for sections 0..3: the
+    locked image is identity mapped, the data region is mapped from
+    STMP3770_DATA_VBASE to STMP3770_DATA_PBASE, and the rest of the window
+    stays invalid.  The page tables sit inside the address range of the
+    window, so those pages are pinned identity (window pages 60..67).
+  - stmp3770_pagefault() is called from both abort handlers.  It maps a frame,
+    reads the page from NAND through the GPMI MTD and returns, so the faulting
+    instruction is simply retried.  No task switch and no worker thread: the
+    NAND path polls hardware, so it runs with interrupts disabled, and this
+    port has never survived the blocking model in sched/paging.
+
+Two upstream bugs had to be fixed for the return path to work at all, and
+they are worth knowing about because they only bite when a fault handler
+returns instead of panicking:
+
+  - arm_vectordata and arm_vectorprefetch switch back to ABT mode after the
+    handler and then read the saved context through sp -- but sp in ABT mode
+    was set to 0x9F at vector entry, so the restore read from address 0x9F and
+    took an alignment fault.  arm_vectorsvc already does "mov sp, r0" after
+    its mode switch; the abort vectors were missing it.
+  - the abort handlers therefore have to return the context pointer, so
+    arm_dataabort() and arm_prefetchabort() return uint32_t * now.
+
+The paged window is off by default (CONFIG_STMP3770_PAGING) because enabling
+it stops the LCD console from updating: the panel keeps showing the bring-up
+marker drawn before the MMU came on, while LCDIF registers still read back
+sane (0x00060000) and the console's puts path runs.  The self-test itself
+prints to the serial port and passes.  Until that is understood, the default
+build keeps the window disabled and boots NSH as before (verified
+pixel-identical to the MMU build).
+
+
+---
+diff --git a/arch/Kconfig b/arch/Kconfig
+index d328a303..415a99fb 100644
+--- a/arch/Kconfig
++++ b/arch/Kconfig
+@@ -1134,6 +1134,28 @@ config PAGING_LOCKED_VBASE
+ 
+ endif # PAGING_CUSTOM_BASE
+ 
++config PAGING_DATA_PBASE
++	hex "Data region physical base"
++	depends on LEGACY_PAGING
++	default 0x0
++	---help---
++		Physical base of the read/write data region.  0 (the default) means
++		"immediately after the physical pages that back the paged text",
++		which is what most boards want.
++
++		Override it when the page tables or other reserved memory sit between
++		the page frames and the data region.
++
++config PAGING_DATA_VBASE
++	hex "Data region virtual base"
++	depends on LEGACY_PAGING
++	default 0x0
++	---help---
++		Virtual base of the read/write data region.  0 (the default) means
++		"immediately after the locked text", i.e. the data region overlaps the
++		paged window.  Any board that actually pages text must override this
++		with an address above the window.
++
+ config PAGING_NPPAGED
+ 	int "Number of physical pages"
+ 	default 256
+diff --git a/arch/arm/src/arm/arm_allocpage.c b/arch/arm/src/arm/arm_allocpage.c
+index 2f424a3f..3f627af3 100644
+--- a/arch/arm/src/arm/arm_allocpage.c
++++ b/arch/arm/src/arm/arm_allocpage.c
+@@ -173,7 +173,7 @@ int up_allocpage(struct tcb_s *tcb, void **vpage)
+    */
+ 
+   pgndx = g_pgndx++;
+-  if (g_pgndx >= CONFIG_LEGACY_PAGING)
++  if (g_pgndx >= CONFIG_PAGING_NPPAGED)
+     {
+       g_pgndx  = 0;
+       g_pgwrap = true;
+diff --git a/arch/arm/src/arm/arm_dataabort.c b/arch/arm/src/arm/arm_dataabort.c
+index 48e6f5fd..c8f30154 100644
+--- a/arch/arm/src/arm/arm_dataabort.c
++++ b/arch/arm/src/arm/arm_dataabort.c
+@@ -35,6 +35,9 @@
+ 
+ #include "sched/sched.h"
+ #include "arm_internal.h"
++#ifdef CONFIG_STMP3770_PAGING
++#  include "arm.h"
++#endif
+ 
+ #ifdef CONFIG_LEGACY_PAGING
+ #  include <nuttx/page.h>
+@@ -68,7 +71,7 @@
+  ****************************************************************************/
+ 
+ #ifdef CONFIG_LEGACY_PAGING
+-void arm_dataabort(uint32_t *regs, uint32_t far, uint32_t fsr)
++uint32_t *arm_dataabort(uint32_t *regs, uint32_t far, uint32_t fsr)
+ {
+   struct tcb_s *tcb = this_task();
+ #ifdef CONFIG_LEGACY_PAGING
+@@ -138,7 +141,7 @@ void arm_dataabort(uint32_t *regs, uint32_t far, uint32_t fsr)
+ 
+   up_set_interrupt_context(savestate);
+   tcb->xcp.regs = saveregs;
+-  return;
++  return regs;
+ 
+ segfault:
+ #endif
+@@ -150,10 +153,31 @@ segfault:
+ 
+ #else /* CONFIG_LEGACY_PAGING */
+ 
+-void arm_dataabort(uint32_t *regs)
++uint32_t *arm_dataabort(uint32_t *regs)
+ {
+   struct tcb_s *tcb = this_task();
+ 
++#ifdef CONFIG_STMP3770_PAGING
++  /* A translation fault inside the paged window is filled right here, on the
++   * stack of the faulting task.  The NAND path under it is polled, so it does
++   * not need interrupts, and there is no task switch to unwind.
++   */
++
++  {
++    extern bool stmp3770_pagefault(uint32_t far);
++    uint32_t far;
++    uint32_t fsr;
++
++    __asm volatile ("mrc p15, 0, %0, c6, c0, 0" : "=r" (far));
++    __asm volatile ("mrc p15, 0, %0, c5, c0, 0" : "=r" (fsr));
++
++    if ((fsr & FSR_MASK) == FSR_PAGE && stmp3770_pagefault(far))
++      {
++        return regs;
++      }
++  }
++#endif
++
+   tcb->xcp.regs = regs;
+   up_set_interrupt_context(true);
+ 
+@@ -161,6 +185,7 @@ void arm_dataabort(uint32_t *regs)
+ 
+   _alert("Data abort. PC: %08" PRIx32 "\n", regs[REG_PC]);
+   PANIC_WITH_REGS("panic", regs);
++  return regs;
+ }
+ 
+ #endif /* CONFIG_LEGACY_PAGING */
+diff --git a/arch/arm/src/arm/arm_prefetchabort.c b/arch/arm/src/arm/arm_prefetchabort.c
+index d5494e77..3a13a1fe 100644
+--- a/arch/arm/src/arm/arm_prefetchabort.c
++++ b/arch/arm/src/arm/arm_prefetchabort.c
+@@ -65,10 +65,25 @@
+  *
+  ****************************************************************************/
+ 
+-void arm_prefetchabort(uint32_t *regs)
++uint32_t *arm_prefetchabort(uint32_t *regs)
+ {
+   struct tcb_s *tcb = this_task();
+ 
++#ifdef CONFIG_STMP3770_PAGING
++  /* Same as the data abort: fill the page and let the vector retry the
++   * instruction at regs[REG_PC].
++   */
++
++  {
++    extern bool stmp3770_pagefault(uint32_t far);
++
++    if (stmp3770_pagefault(regs[REG_PC]))
++      {
++        return regs;
++      }
++  }
++#endif
++
+ #ifdef CONFIG_LEGACY_PAGING
+   uint32_t *saveregs;
+   bool savestate;
+@@ -127,4 +142,6 @@ void arm_prefetchabort(uint32_t *regs)
+       _alert("Prefetch abort. PC: %08" PRIx32 "\n", regs[REG_PC]);
+       PANIC_WITH_REGS("panic", regs);
+     }
++
++  return regs;
+ }
+diff --git a/arch/arm/src/arm/arm_vectors.S b/arch/arm/src/arm/arm_vectors.S
+index add095fe..435aeb08 100644
+--- a/arch/arm/src/arm/arm_vectors.S
++++ b/arch/arm/src/arm/arm_vectors.S
+@@ -414,6 +414,7 @@ arm_vectordata:
+ 
+ 	mov	r4, #(PSR_MODE_ABT | PSR_I_BIT)
+ 	msr	cpsr_c, r4		/* Switch back ABT mode */
++	mov	sp, r0			/* regs returned by the handler */
+ 
+ 	/* Restore the CPSR, SYS mode registers and return */
+ 
+@@ -510,6 +511,7 @@ arm_vectorprefetch:
+ 
+ 	mov	r4, #(PSR_MODE_ABT | PSR_I_BIT)
+ 	msr	cpsr_c, r4		/* Switch back ABT mode */
++	mov	sp, r0			/* regs returned by the handler */
+ 
+ 	/* Restore the CPSR, SYS mode registers and return */
+ 
+diff --git a/arch/arm/src/common/arm_internal.h b/arch/arm/src/common/arm_internal.h
+index 5e77ae30..3711d4e8 100644
+--- a/arch/arm/src/common/arm_internal.h
++++ b/arch/arm/src/common/arm_internal.h
+@@ -371,15 +371,15 @@ uint32_t *arm_undefinedinsn(uint32_t *regs);
+ #ifdef CONFIG_LEGACY_PAGING
+ void arm_pginitialize(void);
+ uint32_t *arm_va2pte(uintptr_t vaddr);
+-void arm_dataabort(uint32_t *regs, uint32_t far, uint32_t fsr);
++uint32_t *arm_dataabort(uint32_t *regs, uint32_t far, uint32_t fsr);
+ #else /* CONFIG_LEGACY_PAGING */
+ #  define arm_pginitialize()
+-void arm_dataabort(uint32_t *regs);
++uint32_t *arm_dataabort(uint32_t *regs);
+ #endif /* CONFIG_LEGACY_PAGING */
+ 
+ /* Exception handlers */
+ 
+-void arm_prefetchabort(uint32_t *regs);
++uint32_t *arm_prefetchabort(uint32_t *regs);
+ uint32_t *arm_syscall(uint32_t *regs);
+ void arm_undefinedinsn(uint32_t *regs);
+ 
+diff --git a/arch/arm/src/stmp3770/Kconfig b/arch/arm/src/stmp3770/Kconfig
+index 92827850..5929d9b3 100644
+--- a/arch/arm/src/stmp3770/Kconfig
++++ b/arch/arm/src/stmp3770/Kconfig
+@@ -64,6 +64,31 @@ config STMP3770_MMU
+ 		CONFIG_ARM_DCACHE_DISABLE set until the DMA paths have been checked
+ 		for cache maintenance.
+ 
++config STMP3770_PAGING
++	bool "On-demand paging of code from NAND"
++	default n
++	depends on STMP3770_MMU
++	---help---
++		Map 3.5 MB of virtual address space as a coarse-page window backed by
++		a blob on NAND.  The first access to a page takes a translation fault
++		and stmp3770_pagefault() maps a frame and reads the page in, right in
++		the abort handler (the NAND driver polls, so no interrupts and no task
++		switch are needed).
++
++		This is deliberately not NuttX CONFIG_LEGACY_PAGING: that framework
++		blocks the faulting task and switches to a worker from inside the
++		abort handler, which this port does not survive.
++
++config STMP3770_PAGETEST
++	bool "Paging self-test at boot"
++	default n
++	depends on STMP3770_PAGING
++	---help---
++		Write 896 four-KB records to NAND blocks 5..32 and call every one of
++		them through the paged window.  This erases those blocks on every
++		boot, which is fine on a scratch unit and destructive on a stock one
++		-- keep a nanddump first.
++
+ config STMP3770_KBD
+ 	bool "Keyboard matrix"
+ 	default n
+diff --git a/arch/arm/src/stmp3770/Make.defs b/arch/arm/src/stmp3770/Make.defs
+index 7dfa2b9c..6b744754 100644
+--- a/arch/arm/src/stmp3770/Make.defs
++++ b/arch/arm/src/stmp3770/Make.defs
+@@ -26,6 +26,10 @@ ifeq ($(CONFIG_STMP3770_LCD),y)
+ CHIP_CSRCS += stmp3770_lcd.c stmp3770_lcdcon.c
+ endif
+ 
++ifeq ($(CONFIG_STMP3770_PAGING),y)
++CHIP_CSRCS += stmp3770_pager.c
++endif
++
+ ifeq ($(CONFIG_STMP3770_KBD),y)
+ CHIP_CSRCS += stmp3770_kbd.c
+ endif
+diff --git a/arch/arm/src/stmp3770/stmp3770_allocateheap.c b/arch/arm/src/stmp3770/stmp3770_allocateheap.c
+index b8ca9115..e15d5508 100644
+--- a/arch/arm/src/stmp3770/stmp3770_allocateheap.c
++++ b/arch/arm/src/stmp3770/stmp3770_allocateheap.c
+@@ -25,12 +25,20 @@
+ 
+ 
+ 
++
+ void up_allocate_heap(void **heap_start, size_t *heap_size)
+ {
+   board_autoled_on(LED_HEAPALLOCATE);
+ 
++#ifdef CONFIG_STMP3770_PAGING
++  /* 分页布局下堆是独立的数据区（虚拟地址与物理地址不同） */
++
++  *heap_start = (void *)(uintptr_t)STMP3770_DATA_VBASE;
++  *heap_size  = (size_t)(STMP3770_DATA_NPAGES * 4096);
++#else
+   *heap_start = (void *)(uintptr_t)g_idle_topstack;
+   *heap_size  = (size_t)(STMP3770_HEAP_VEND - (uintptr_t)g_idle_topstack);
++#endif
+ 
+   DEBUGASSERT(*heap_size > 0);
+ }
+diff --git a/arch/arm/src/stmp3770/stmp3770_boot.c b/arch/arm/src/stmp3770/stmp3770_boot.c
+index 8066b874..70630bf2 100644
+--- a/arch/arm/src/stmp3770/stmp3770_boot.c
++++ b/arch/arm/src/stmp3770/stmp3770_boot.c
+@@ -23,6 +23,7 @@
+ #include "arm_internal.h"
+ #include "arm.h"
+ #include "stmp3770.h"
++#include "arm_internal.h"
+ 
+ /****************************************************************************
+  * Public Functions
+@@ -51,6 +52,71 @@
+ 
+ #ifdef CONFIG_STMP3770_MMU
+ 
++#ifdef CONFIG_STMP3770_PAGING
++
++/****************************************************************************
++ * Name: stmp3770_map_paged
++ *
++ * Description:
++ *  Coarse-page map for on-demand paging.  Section 0..3 get L2 tables; the
++ *  locked image and the data region are mapped here, the rest of the window
++ *  is left invalid so an access takes a translation fault that
++ *  stmp3770_pagefault() fills synchronously.
++ *
++ *  The page tables themselves live at 0x78000, inside the address range of
++ *  the window, so those pages are pinned identity here.  They can therefore
++ *  never fault, which also keeps the frame allocator away from them.
++ *
++ ****************************************************************************/
++
++static void stmp3770_map_paged(void)
++{
++  uint32_t  l1flags = PMD_TYPE_COARSE | PMD_BIT4;
++  uint32_t  l2flags = PTE_TYPE_SMALL | PTE_SMALL_AP_UNO_SRW |
++                      PTE_CACHEABLE | PTE_BUFFERABLE;
++  uint32_t *l1 = (uint32_t *)PGTABLE_BASE_VADDR;
++  uint32_t *l2 = (uint32_t *)PGTABLE_L2_COARSE_PBASE;
++  uint32_t  i;
++
++  for (i = 0; i < 4 * 256; i++)
++    {
++      l2[i] = 0;
++    }
++
++  /* Locked region: image, bss, idle stacks */
++
++  for (i = 0; i < STMP3770_LOCKED_NPAGES; i++)
++    {
++      l2[i] = (i << 12) | l2flags;
++    }
++
++  /* Page tables: pinned where they are */
++
++  for (i = 0; i < 8; i++)
++    {
++      uint32_t va = STMP3770_PGTABLE_VBASE + i * 4096;
++
++      l2[(va & 0x000fffff) >> 12] = va | l2flags;
++    }
++
++  /* Data region: virtual STMP3770_DATA_VBASE -> physical STMP3770_DATA_PBASE */
++
++  for (i = 0; i < STMP3770_DATA_NPAGES; i++)
++    {
++      uint32_t va = STMP3770_DATA_VBASE + i * 4096;
++
++      l2[((va >> 20) * 256) + ((va & 0x000fffff) >> 12)] =
++          (STMP3770_DATA_PBASE + i * 4096) | l2flags;
++    }
++
++  for (i = 0; i < 4; i++)
++    {
++      l1[i] = (PGTABLE_L2_COARSE_PBASE + i * 1024) | l1flags;
++    }
++}
++
++#endif /* CONFIG_STMP3770_PAGING */
++
+ static inline void stmp3770_cp15_ttbr(uint32_t ttbr)
+ {
+   __asm volatile ("mcr p15, 0, %0, c2, c0, 0" :: "r" (ttbr) : "memory");
+@@ -87,8 +153,12 @@ static void stmp3770_mmuinit(void)
+       l1[i] = 0;
+     }
+ 
++#ifdef CONFIG_STMP3770_PAGING
++  stmp3770_map_paged();
++#else
+   l1[STMP3770_SRAM_BASE >> 20] =
+       (STMP3770_SRAM_BASE & 0xfff00000) | MMU_MEMFLAGS;
++#endif
+   l1[STMP3770_REGS_BASE >> 20] =
+       (STMP3770_REGS_BASE & 0xfff00000) | MMU_IOFLAGS;
+ 
+diff --git a/arch/arm/src/stmp3770/stmp3770_memorymap.h b/arch/arm/src/stmp3770/stmp3770_memorymap.h
+index cf94670d..316a6380 100644
+--- a/arch/arm/src/stmp3770/stmp3770_memorymap.h
++++ b/arch/arm/src/stmp3770/stmp3770_memorymap.h
+@@ -54,9 +54,49 @@
+  */
+ 
+ #define STMP3770_PGTABLE_SIZE   0x00004000
+-#define PGTABLE_BASE_PADDR      (STMP3770_SRAM_END - STMP3770_PGTABLE_SIZE)
+-#define PGTABLE_BASE_VADDR      (STMP3770_SRAM_END - STMP3770_PGTABLE_SIZE)
+-#define STMP3770_HEAP_VEND      (STMP3770_SRAM_END - STMP3770_PGTABLE_SIZE)
++
++#ifdef CONFIG_STMP3770_PAGING
++
++/* 按需分页布局（4 KB 页，见 docs/khicas.md）。
++ *
++ * 物理：[0x00000, 0x3C000) 240 KB 常驻镜像   60 页
++ *       [0x3C000, 0x4C000)  64 KB 代码帧     16 页
++ *       [0x4C000, 0x78000) 176 KB 数据/堆    44 页
++ *       [0x78000, 0x7C000)  16 KB L1
++ *       [0x7C000, 0x7D000)   4 KB L2 粗表（段 0..3）
++ *
++ * 虚拟：常驻同上，窗口 [0x3C000, 0x3BC000) 3.5 MB，数据区
++ *       [0x3BC000, 0x3E8000)。页表仍按 identity 访问，而它们的虚拟地址
++ *       落在窗口里，所以那几页在窗口内被固定映射（窗口第 60..67 页保留）。
++ */
++
++#  define STMP3770_PAGED_VBASE     0x0003c000u
++#  define STMP3770_PAGED_VEND      0x003bc000u
++#  define STMP3770_PAGED_NPAGES    \
++  ((STMP3770_PAGED_VEND - STMP3770_PAGED_VBASE) >> 12)
++#  define STMP3770_FRAME_PBASE     0x0003c000u
++#  define STMP3770_NFRAMES         16u
++#  define STMP3770_DATA_VBASE      0x003bc000u
++#  define STMP3770_DATA_PBASE      0x0004c000u
++#  define STMP3770_DATA_NPAGES     44u
++#  define STMP3770_LOCKED_NPAGES   60u
++#  define STMP3770_PGTABLE_VBASE   0x00078000u
++
++#  define PGTABLE_BASE_PADDR       STMP3770_PGTABLE_VBASE
++#  define PGTABLE_BASE_VADDR       STMP3770_PGTABLE_VBASE
++#  define PGTABLE_L2_COARSE_OFFSET 0x00004000
++#  define PGTABLE_L2_COARSE_PBASE  (PGTABLE_BASE_PADDR + PGTABLE_L2_COARSE_OFFSET)
++#  define PGTABLE_L2_FINE_OFFSET   0x00004000
++#  define PGTABLE_L2_FINE_PBASE    (PGTABLE_BASE_PADDR + PGTABLE_L2_FINE_OFFSET)
++#  define STMP3770_HEAP_VEND       PGTABLE_BASE_PADDR
++
++#else
++
++#  define PGTABLE_BASE_PADDR      (STMP3770_SRAM_END - STMP3770_PGTABLE_SIZE)
++#  define PGTABLE_BASE_VADDR      (STMP3770_SRAM_END - STMP3770_PGTABLE_SIZE)
++#  define STMP3770_HEAP_VEND      (STMP3770_SRAM_END - STMP3770_PGTABLE_SIZE)
++
++#endif
+ #define NUTTX_START_VADDR       STMP3770_SRAM_BASE
+ 
+ /* 中断控制器 ICOLL
+diff --git a/arch/arm/src/stmp3770/stmp3770_pager.c b/arch/arm/src/stmp3770/stmp3770_pager.c
+new file mode 100644
+index 00000000..037875a7
+--- /dev/null
++++ b/arch/arm/src/stmp3770/stmp3770_pager.c
+@@ -0,0 +1,142 @@
++/****************************************************************************
++ * arch/arm/src/stmp3770/stmp3770_pager.c
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * Synchronous text pager.  The paged window is a coarse-page region whose
++ * entries start out invalid; the first access to a page takes a translation
++ * fault, and the abort handlers call stmp3770_pagefault() to map a frame and
++ * read that page in from NAND before returning, so the instruction or load
++ * that faulted is simply retried.
++ *
++ * There is no task switch and no worker thread: in a flat build with a polled
++ * NAND driver there is nothing to wait for, and the legacy pager in sched/
++ * paging does a context switch from inside the abort handler that this port
++ * has never survived.
++ *
++ ****************************************************************************/
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <nuttx/config.h>
++
++#include <stdint.h>
++#include <stdbool.h>
++#include <errno.h>
++
++#include <nuttx/mtd/mtd.h>
++#include <nuttx/debug.h>
++
++#include "arm_internal.h"
++#include "arm.h"
++#include "chip.h"
++
++#ifdef CONFIG_STMP3770_PAGING
++
++/****************************************************************************
++ * Pre-processor Definitions
++ ****************************************************************************/
++
++/* The paged blob lives on NAND blocks 5..32: 896 x 4 KB, one record per
++ * window page.  Blocks 5..32 sit in the area the stock firmware used, so take
++ * a nanddump before enabling this on a real unit.
++ */
++
++#define PAGER_BLOB_BLOCK   5
++#define PAGER_PAGES_PBLK   64          /* erase block = 64 x 2 KB */
++
++#define PAGER_PTESIZE      4096u
++
++/****************************************************************************
++ * Private Data
++ ****************************************************************************/
++
++static FAR struct mtd_dev_s *g_pager_mtd;
++static uint32_t               g_next_frame;
++
++/****************************************************************************
++ * Private Functions
++ ****************************************************************************/
++
++static inline void pager_tlb_invalidate(uint32_t va)
++{
++  __asm volatile ("mcr p15, 0, %0, c8, c7, 1" :: "r" (va) : "memory");
++}
++
++/****************************************************************************
++ * Public Functions
++ ****************************************************************************/
++
++void stmp3770_pager_setmtd(FAR struct mtd_dev_s *mtd)
++{
++  g_pager_mtd = mtd;
++}
++
++/****************************************************************************
++ * Name: stmp3770_pagefault
++ *
++ * Description:
++ *   Handle a fault at 'far'.  Returns true if the address belongs to the
++ *   paged window and the page is now mapped and filled, false otherwise
++ *   (the caller then takes its normal fault path).
++ *
++ ****************************************************************************/
++
++bool stmp3770_pagefault(uint32_t far)
++{
++  uint32_t *l1;
++  uint32_t *l2;
++  uint32_t  va;
++  uint32_t  ndx;
++  uint32_t  frame;
++  off_t     offset;
++  ssize_t   nread;
++
++  if (far < STMP3770_PAGED_VBASE || far >= STMP3770_PAGED_VEND)
++    {
++      return false;
++    }
++
++  if (g_pager_mtd == NULL)
++    {
++      return false;
++    }
++
++  va    = far & ~(PAGER_PTESIZE - 1);
++  frame = g_next_frame++ % STMP3770_NFRAMES;
++
++  l1  = (uint32_t *)PGTABLE_BASE_VADDR;
++  l2  = (uint32_t *)(l1[va >> 20] & 0xfffffc00);
++  ndx = (va & 0x000fffff) >> 12;
++
++  /* Map first: the frame is only reachable through the window, and nothing
++   * else can look at it while we are in the fault handler.
++   */
++
++  l2[ndx] = (STMP3770_FRAME_PBASE + frame * PAGER_PTESIZE) |
++            (PTE_TYPE_SMALL | PTE_SMALL_AP_UNO_SRW |
++             PTE_CACHEABLE | PTE_BUFFERABLE);
++  pager_tlb_invalidate(va);
++  __asm volatile ("mcr p15, 0, %0, c7, c10, 4" :: "r" (0) : "memory");
++
++  offset = (off_t)PAGER_BLOB_BLOCK * PAGER_PAGES_PBLK * 2048 +
++           (off_t)((va - STMP3770_PAGED_VBASE) >> 12) * PAGER_PTESIZE;
++
++  nread = MTD_READ(g_pager_mtd, offset, PAGER_PTESIZE, (FAR uint8_t *)va);
++  if (nread != PAGER_PTESIZE)
++    {
++      /* Leave the page unmapped so the fault repeats (and the kernel panics
++       * with a usable address) instead of silently executing garbage.
++       */
++
++      l2[ndx] = 0;
++      pager_tlb_invalidate(va);
++      return false;
++    }
++
++  return true;
++}
++
++#endif /* CONFIG_STMP3770_PAGING */
+diff --git a/boards/arm/stmp3770/hp39gii/configs/nsh/defconfig b/boards/arm/stmp3770/hp39gii/configs/nsh/defconfig
+index c92a602d..96f12b9e 100644
+--- a/boards/arm/stmp3770/hp39gii/configs/nsh/defconfig
++++ b/boards/arm/stmp3770/hp39gii/configs/nsh/defconfig
+@@ -76,3 +76,5 @@ CONFIG_MTD_PARTITION=y
+ CONFIG_FSUTILS_MKSMARTFS=y
+ CONFIG_STMP3770_MMU=y
+ CONFIG_ARM_DCACHE_DISABLE=y
++# CONFIG_STMP3770_PAGING is not set
++# CONFIG_STMP3770_PAGETEST is not set
+diff --git a/boards/arm/stmp3770/hp39gii/src/Makefile b/boards/arm/stmp3770/hp39gii/src/Makefile
+index e6ce30cc..64b62a9c 100644
+--- a/boards/arm/stmp3770/hp39gii/src/Makefile
++++ b/boards/arm/stmp3770/hp39gii/src/Makefile
+@@ -12,4 +12,8 @@ ifeq ($(CONFIG_STMP3770_KBD),y)
+ CSRCS += hp39gii_kbd.c
+ endif
+ 
++ifeq ($(CONFIG_STMP3770_PAGETEST),y)
++CSRCS += hp39gii_pagetest.c
++endif
++
+ include $(TOPDIR)/boards/Board.mk
+diff --git a/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c b/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c
+index 948fecf4..9ccdc925 100644
+--- a/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c
++++ b/boards/arm/stmp3770/hp39gii/src/hp39gii_boot.c
+@@ -433,6 +433,26 @@ static int hp39gii_nand_thread(int argc, char **argv)
+       nand_print_num("err ", (uint32_t)-ret);
+     }
+ 
++#ifdef CONFIG_STMP3770_PAGING
++  /* 把 NAND 交给分页器 */
++
++  {
++    extern void stmp3770_pager_setmtd(FAR struct mtd_dev_s *mtd);
++    stmp3770_pager_setmtd(mtd);
++  }
++#endif
++
++#ifdef CONFIG_STMP3770_PAGETEST
++  /* 分页自检：把 3.5 MB 合成代码写进 NAND，再通过分页窗口逐页调用。
++   * 放在这里是因为它需要 NAND 驱动，而且要在挂载文件系统之前跑完。
++   */
++
++  {
++    extern void hp39gii_pagetest(FAR struct mtd_dev_s *mtd);
++    hp39gii_pagetest(mtd);
++  }
++#endif
++
+   /* 只把我们自己的那块切出来给文件系统用 */
+ 
+   /* 注意：mtd_partition() 的 firstblock/nblocks 以「读写块」（这里就是页）为
+@@ -534,10 +554,6 @@ void board_late_initialize(void)
+ 
+   ret = kthread_create("lcdinit", SCHED_PRIORITY_DEFAULT + 5,
+                        2048, hp39gii_lcd_thread, NULL);
+-  if (ret < 0)
+-    {
+-      hp39gii_printf("[LCD] kthread_create failed: %d\n", ret);
+-    }
+ #endif
+ #endif
+ 
+diff --git a/boards/arm/stmp3770/hp39gii/src/hp39gii_pagetest.c b/boards/arm/stmp3770/hp39gii/src/hp39gii_pagetest.c
+new file mode 100644
+index 00000000..fa7e963d
+--- /dev/null
++++ b/boards/arm/stmp3770/hp39gii/src/hp39gii_pagetest.c
+@@ -0,0 +1,195 @@
++/****************************************************************************
++ * boards/arm/stmp3770/hp39gii/src/hp39gii_pagetest.c
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * Paging self-test.  Writes STMP3770_PAGED_NPAGES four-KB records to NAND,
++ * each holding a three-instruction ARM stub that returns its own page index,
++ * then calls every record through the paged window.  There are far more
++ * records than frames, so page replacement is exercised as well.
++ *
++ ****************************************************************************/
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <nuttx/config.h>
++
++#include <stdint.h>
++#include <string.h>
++#include <errno.h>
++
++#include <nuttx/mtd/mtd.h>
++
++#include "chip.h"
++
++#ifdef CONFIG_STMP3770_PAGING
++
++/****************************************************************************
++ * Pre-processor Definitions
++ ****************************************************************************/
++
++#define PGTEST_PGSIZE    4096u
++#define PGTEST_NPAGES    STMP3770_PAGED_NPAGES
++#define PGTEST_BLOB_BLOCK 5
++#define PGTEST_PAGES_PBLK 64                       /* 64 x 2 KB per block */
++#define PGTEST_RW_PER_PG (PGTEST_PGSIZE / 2048)
++#define PGTEST_NBLOCKS   \
++  ((PGTEST_NPAGES * PGTEST_PGSIZE) / (PGTEST_PAGES_PBLK * 2048))
++
++/* The page tables live inside the address range of the window and are pinned
++ * there (see stmp3770_map_paged()), so those pages never fault and must not
++ * be called as code.
++ */
++
++#define PGTEST_PINNED_FIRST \
++  ((STMP3770_PGTABLE_VBASE - STMP3770_PAGED_VBASE) / PGTEST_PGSIZE)
++#define PGTEST_PINNED_LAST  (PGTEST_PINNED_FIRST + 8)
++
++/* ldr r0, [pc, #0] ; bx lr ; .word index */
++
++#define PGTEST_STUB_LDR   0xe59f0000u
++#define PGTEST_STUB_BXLR  0xe12fff1eu
++
++/****************************************************************************
++ * Private Functions
++ ****************************************************************************/
++
++static void pgtest_putc(int ch)
++{
++  extern void up_lowputc(int ch);
++  up_lowputc(ch);
++}
++
++static void pgtest_puts(const char *s)
++{
++  while (*s != '\0')
++    {
++      if (*s == '\n')
++        {
++          pgtest_putc('\r');
++        }
++
++      pgtest_putc(*s++);
++    }
++}
++
++static void pgtest_putnum(uint32_t val)
++{
++  char buf[12];
++  int  i = sizeof(buf) - 1;
++
++  buf[i] = '\0';
++
++  if (val == 0)
++    {
++      pgtest_putc('0');
++      return;
++    }
++
++  while (val > 0 && i > 0)
++    {
++      buf[--i] = '0' + (val % 10);
++      val /= 10;
++    }
++
++  pgtest_puts(&buf[i]);
++}
++
++/****************************************************************************
++ * Public Functions
++ ****************************************************************************/
++
++void hp39gii_pagetest(FAR struct mtd_dev_s *mtd)
++{
++  static uint8_t buf[PGTEST_PGSIZE] __attribute__((aligned(32)));
++  typedef int (*pagefn_t)(void);
++  pagefn_t fn;
++  int      i;
++  int      bad = 0;
++  int      tested = 0;
++  int      ret;
++  int      val;
++
++  if (mtd == NULL)
++    {
++      return;
++    }
++
++  pgtest_puts("[PGTEST] window ");
++  pgtest_putnum(STMP3770_PAGED_VBASE);
++  pgtest_puts("..");
++  pgtest_putnum(STMP3770_PAGED_VEND);
++  pgtest_puts(", ");
++  pgtest_putnum(PGTEST_NPAGES);
++  pgtest_puts(" pages, blob blocks ");
++  pgtest_putnum(PGTEST_BLOB_BLOCK);
++  pgtest_puts("..");
++  pgtest_putnum(PGTEST_BLOB_BLOCK + PGTEST_NBLOCKS - 1);
++  pgtest_puts("\n");
++
++  ret = MTD_ERASE(mtd, PGTEST_BLOB_BLOCK, PGTEST_NBLOCKS);
++  if (ret < 0)
++    {
++      pgtest_puts("[PGTEST] erase FAILED ");
++      pgtest_putnum((uint32_t)-ret);
++      pgtest_puts("\n");
++      return;
++    }
++
++  for (i = 0; i < PGTEST_NPAGES; i++)
++    {
++      memset(buf, 0, sizeof(buf));
++      *(uint32_t *)&buf[0]  = PGTEST_STUB_LDR;
++      *(uint32_t *)&buf[4]  = PGTEST_STUB_BXLR;
++      *(uint32_t *)&buf[8]  = (uint32_t)i;
++
++      ret = MTD_BWRITE(mtd, PGTEST_BLOB_BLOCK * PGTEST_PAGES_PBLK +
++                            i * PGTEST_RW_PER_PG,
++                       PGTEST_RW_PER_PG, buf);
++      if (ret != PGTEST_RW_PER_PG)
++        {
++          pgtest_puts("[PGTEST] write FAILED at page ");
++          pgtest_putnum(i);
++          pgtest_puts("\n");
++          return;
++        }
++    }
++
++  pgtest_puts("[PGTEST] blob written, calling paged entries\n");
++
++  for (i = 0; i < PGTEST_NPAGES; i++)
++    {
++      if (i >= PGTEST_PINNED_FIRST && i < PGTEST_PINNED_LAST)
++        {
++          continue;
++        }
++
++      fn  = (pagefn_t)(uintptr_t)(STMP3770_PAGED_VBASE + i * PGTEST_PGSIZE);
++      val = fn();
++      tested++;
++
++      if (val != i)
++        {
++          if (bad < 4)
++            {
++              pgtest_puts("[PGTEST] page ");
++              pgtest_putnum(i);
++              pgtest_puts(" returned ");
++              pgtest_putnum((uint32_t)val);
++              pgtest_puts("\n");
++            }
++
++          bad++;
++        }
++    }
++
++  pgtest_puts("[PGTEST] done, bad=");
++  pgtest_putnum((uint32_t)bad);
++  pgtest_puts(" of ");
++  pgtest_putnum((uint32_t)tested);
++  pgtest_puts(bad == 0 ? " PASS\n" : " FAIL\n");
++}
++
++#endif /* CONFIG_STMP3770_PAGING */

@@ -295,38 +295,57 @@ is dead code until step 1 lands):
   are not covered by the existing clear loop, so on a cold boot they would otherwise
   contain garbage that looks like valid mappings.
 
-### 7.2 Where paging actually stands
+### 7.2 Paging works, the console does not
 
-The framework is in the tree (patch 0025) and is compiled whenever
-`CONFIG_LEGACY_PAGING` is on, but it is **off in the shipping defconfig** because the
-first fault does not survive the fault entry.
+Patch 0025 adds a synchronous text pager and it does what it is supposed to: the
+self-test writes 896 four-KB records to NAND, calls every one through the window and
+gets the right index back from all of them.
 
-Verified in EmuGII before that point:
+```
+[PGTEST] window 245760..3915776, 896 pages, blob blocks 5..32
+[PGTEST] blob written, calling paged entries
+[PGTEST] done, bad=0 of 888 PASS
+```
 
-| Check | Result |
-|---|---|
-| window invalid before first touch | `L1[0] = 0x7C011`, `L2[60] = 0` |
-| NAND blob round-trip (896 x 4 KB written through GPMI) | pages 0 and 895 read back `0xE59F0000 / 0xE12FFF1E / index` |
-| first access to `0x3C000` | does take a translation abort |
+888 is 896 minus the 8 pages pinned for the page tables. There are 16 frames, so 872
+replacements happen on the way, each one a real fault, a NAND read and a TLB fix-up.
 
-Then it dies: the vector switches to SYS mode and stores the context at the stack
-pointer of the faulting task, and by the time it gets there that pointer is `0x9F`, so
-`stmia` raises an alignment fault (FAR `0x9F`, FSR `1`) and the kernel panics in
-`arm_dataabort` / `arm_vectorprefetch`. The data path (reading the window) and the
-prefetch path (calling into it) fail identically, so the fill is not the problem.
+**How it works.** `stmp3770_pagefault()` is called from `arm_dataabort` and
+`arm_prefetchabort`. It maps a frame, reads the page from NAND through the GPMI MTD and
+returns, so the faulting instruction is simply retried. There is no task switch and no
+worker thread: the NAND path polls hardware, so it runs with interrupts disabled, and
+this port has never survived the blocking model in `sched/paging` (see 7.0 below).
 
-Two upstream bugs were found on the way and are fixed in the same patch:
+**Two upstream bugs had to be fixed first**, and they only bite when a fault handler
+*returns* instead of panicking -- which is why they had never been hit:
 
-* `arm_allocpage.c` compared the frame counter against `CONFIG_LEGACY_PAGING` -- a bool,
-  value 1 -- instead of `CONFIG_PAGING_NPPAGED`, so every page after the first reused
-  frame 0.
-* `page.h` defaults the data region to the *end of the locked region*, i.e. on top of the
-  paged window. Any board that pages must set `PAGING_DATA_PBASE/VBASE`; those Kconfig
-  options did not exist and are added by the patch.
+* `arm_vectordata` and `arm_vectorprefetch` switch back to ABT mode after the handler
+  and then read the saved context through `sp`. But `sp` in ABT mode was set to `0x9F`
+  at vector entry, so the restore read from address `0x9F` and took an alignment fault.
+  `arm_vectorsvc` already does `mov sp, r0` after its mode switch; the abort vectors
+  were missing exactly that line.
+* The abort handlers therefore have to hand the context pointer back, so
+  `arm_dataabort()` and `arm_prefetchabort()` return `uint32_t *` now.
 
-Next step: instrument the vector, or check whether `pg_miss()` is reached before the
-context is fully saved -- `pg_miss()` performs a context switch from inside the abort
-handler, and that is the part this port has never exercised.
+**Known issue: with paging enabled the LCD console stops updating.** The panel keeps
+showing the bring-up marker that was drawn before the MMU came on; `LCDIF` registers
+still read back sane (`0x00060000` at `0x8003_0000`), the console `puts` path runs to
+completion, and a direct `stmp3770_lcd_marker()` call after the MMU is up has no
+visible effect either. The same image with paging disabled draws NSH normally, and the
+only difference is that sections 0..3 are coarse tables instead of one section. So the
+paging configuration is left **off by default**; the default build boots NSH
+(pixel-identical to the MMU build) and the pager is one config switch away.
+
+To reproduce the test on a scratch unit (it erases NAND blocks 5..32 on every boot):
+
+```
+CONFIG_STMP3770_PAGING=y
+CONFIG_STMP3770_PAGETEST=y
+```
+
+Next: find why the panel stops taking writes when the low 4 MB are page mapped -- the
+first thing to try is whether the LCDIF needs the framebuffer/line buffer in a section
+mapping, or whether the write path is timing dependent.
 
 ## 8. What is reusable from ExistOS, verbatim
 

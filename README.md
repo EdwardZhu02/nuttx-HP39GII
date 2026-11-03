@@ -39,6 +39,7 @@ Verified on real hardware unless marked otherwise.
 | Boot menu, "HP OS" entry | ❌ disabled — the stock boot flow needs the mask ROM and high vectors; executing it from the menu ends in a black screen (see [docs/boot-chain.md](docs/boot-chain.md#why-hp-os-is-disabled)) |
 | USB device (CDC-ACM) under NuttX | ❌ not implemented |
 | LCD framebuffer / graphics beyond the 32×16 text console | ❌ not implemented |
+| On-demand paging (3.5 MB window over NAND) | ⚠️ works when enabled -- 888/888 paged calls pass -- but the LCD console stops updating, so it is off by default; see [docs/khicas.md](docs/khicas.md) |
 | KhiCAS (Giac/Xcas) | ⚠️ not started — 2.44 MB of code on a 512 KB machine, so it needs on-demand paging, and paging needs the MMU, which this port currently keeps off; see [docs/khicas.md](docs/khicas.md) |
 | Linux on this device | ❌ impossible — 512 KB of RAM, see [docs/hardware.md](docs/hardware.md#there-is-no-dram) |
 
